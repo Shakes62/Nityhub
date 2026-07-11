@@ -1,0 +1,118 @@
+@import "tailwindcss";
+
+/* ---------------------------------------------------------------------------
+   NityHub design system
+   Clean, modern, light SaaS palette. Tokens are exposed to Tailwind v4 via
+   @theme so they generate utilities (bg-surface, text-muted, rounded-card…).
+--------------------------------------------------------------------------- */
+@theme {
+  /* Surfaces */
+  --color-canvas: #f4f6fb;
+  --color-surface: #ffffff;
+  --color-surface-muted: #f1f4f9;
+  --color-surface-soft: #f8fafc;
+
+  /* Borders */
+  --color-border: #e6eaf1;
+  --color-border-strong: #d3dae6;
+
+  /* Text */
+  --color-ink: #0f1729;
+  --color-ink-soft: #414d63;
+  --color-muted: #66748c;
+
+  /* Brand */
+  --color-brand: #2563eb;
+  --color-brand-strong: #1d4ed8;
+  --color-brand-soft: #eef4ff;
+  --color-brand-ink: #ffffff;
+
+  /* Semantic */
+  --color-success: #067a4e;
+  --color-success-soft: #e7f7ef;
+  --color-warning: #b25b09;
+  --color-warning-soft: #fff4e2;
+  --color-danger: #c8383f;
+  --color-danger-soft: #fdecee;
+  --color-info: #1d64c9;
+  --color-info-soft: #eaf2ff;
+
+  /* Radii */
+  --radius-card: 18px;
+  --radius-lg: 14px;
+  --radius-md: 10px;
+  --radius-sm: 8px;
+
+  /* Shadows */
+  --shadow-xs: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --shadow-sm: 0 6px 16px rgba(24, 40, 72, 0.06);
+  --shadow-md: 0 14px 34px rgba(24, 40, 72, 0.09);
+  --shadow-lg: 0 22px 50px rgba(24, 40, 72, 0.12);
+
+  /* Typography */
+  --font-sans: var(--font-outfit), ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, sans-serif;
+
+  /* Layout */
+  --spacing-sidebar: 17rem;
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background:
+      radial-gradient(circle at top left, rgba(37, 99, 235, 0.07), transparent 30%),
+      radial-gradient(circle at top right, rgba(6, 122, 78, 0.05), transparent 26%),
+      linear-gradient(180deg, #fbfcfe 0%, var(--color-canvas) 60%);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-feature-settings: "cv11", "ss01";
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-brand);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+}
+
+@layer utilities {
+  /* Hide scrollbars while keeping scroll (matches original UX). */
+  .no-scrollbar {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+    display: none;
+  }
+
+  @keyframes shimmer {
+    100% {
+      transform: translateX(100%);
+    }
+  }
+  .animate-shimmer::after {
+    animation: shimmer 1.6s infinite;
+  }
+
+  @keyframes toast-in {
+    from {
+      opacity: 0;
+      transform: translateY(-8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  .animate-toast-in {
+    animation: toast-in 0.2s ease-out;
+  }
+}
