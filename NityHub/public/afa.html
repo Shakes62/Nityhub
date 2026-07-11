@@ -1,0 +1,155 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NityHub | AFA</title>
+  <link rel="stylesheet" href="/css/app.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <div id="mobile-overlay" class="mobile-overlay"></div>
+
+    <aside id="sidebar" class="sidebar">
+      <div class="brand-lockup">
+        <div class="brand-badge">NH</div>
+        <div class="brand-copy">
+          <div class="brand-name">NityHub</div>
+          <div class="brand-note">Smart data, cleaner workflow</div>
+        </div>
+      </div>
+
+      <div class="side-user">
+        <div class="side-user-row">
+          <span data-user-chip class="user-chip">Guest</span>
+        </div>
+        <a data-login-link class="btn subtle hidden" href="/auth.html">Sign In</a>
+      </div>
+
+      <nav class="side-nav">
+        <a href="/index.html" data-page="home" data-close-menu>
+          <span>Dashboard</span>
+          <span class="nav-meta">Home</span>
+        </a>
+        <a href="/buy.html" data-page="buy" data-close-menu>
+          <span>Buy Data</span>
+          <span class="nav-meta">Bundles</span>
+        </a>
+        <a href="/orders.html" data-page="orders" data-close-menu>
+          <span>Orders</span>
+          <span class="nav-meta">History</span>
+        </a>
+        <a href="/wallet.html" data-page="wallet" data-close-menu>
+          <span>Wallet</span>
+          <span class="nav-meta">Balance</span>
+        </a>
+        <a href="/account.html" data-page="account" data-close-menu>
+          <span>Account</span>
+          <span class="nav-meta">Profile</span>
+        </a>
+        <a href="/afa.html" data-page="afa" data-close-menu>
+          <span>AFA</span>
+          <span class="nav-meta">Registration</span>
+        </a>
+      </nav>
+
+      <div class="sidebar-footer">
+        <a href="#" data-action="logout" class="btn subtle hidden" style="width: 100%;">Logout</a>
+      </div>
+    </aside>
+
+    <div class="main-shell">
+      <header class="mobile-header">
+        <button id="menu-toggle" class="icon-btn" type="button" aria-label="Open menu">Menu</button>
+        <div class="mobile-title">AFA</div>
+        <span data-user-chip class="user-chip">Guest</span>
+      </header>
+
+      <div class="page-content">
+        <main class="container stack">
+          <div id="page-notice" class="notice hidden"></div>
+
+          <section class="card hero-card">
+            <div class="hero-layout">
+              <div>
+                <h1 class="page-title">AFA</h1>
+                <div class="inline-meta">
+                  <div class="meta-chip">Fee <span id="afa-fee">GHS 0.00</span></div>
+                  <div class="meta-chip success">Wallet <span id="afa-wallet">GHS 0.00</span></div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="card">
+            <h2 class="section-title">Register</h2>
+            <form id="afa-form" class="stack" style="margin-top: 12px;">
+              <div class="grid cols-2">
+                <div class="field">
+                  <label for="afa-fullname">Full Name</label>
+                  <input id="afa-fullname" name="fullname" type="text" required />
+                </div>
+                <div class="field">
+                  <label for="afa-phone">Phone</label>
+                  <input id="afa-phone" name="phone" type="tel" required />
+                </div>
+              </div>
+
+              <div class="grid cols-2">
+                <div class="field">
+                  <label for="afa-dob">Date of Birth</label>
+                  <input id="afa-dob" name="dob" type="date" required />
+                </div>
+                <div class="field">
+                  <label for="afa-card">Ghana Card</label>
+                  <input id="afa-card" name="ghanaCard" type="text" required />
+                </div>
+              </div>
+
+              <div class="field">
+                <label for="afa-location">Location</label>
+                <input id="afa-location" name="location" type="text" required />
+              </div>
+
+              <div class="row wrap">
+                <button id="afa-submit" class="btn primary" type="submit">Submit Registration</button>
+              </div>
+            </form>
+          </section>
+
+          <section class="card">
+            <h2 class="section-title">Records</h2>
+            <div class="table-wrap scroll-area" style="margin-top: 12px;">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Phone</th>
+                    <th>Location</th>
+                    <th>Fee</th>
+                    <th>Date</th>
+                  </tr>
+                </thead>
+                <tbody id="afa-rows">
+                  <tr><td colspan="5" class="muted">Loading...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+  <script src="/js/bootstrap.js?v=render-api-20260321"></script>
+  <script src="/js/config.js?v=render-api-20260321"></script>
+  <script src="/js/firebase.js"></script>
+  <script src="/js/common.js"></script>
+  <script src="/js/layout.js"></script>
+  <script src="/js/afa.js"></script>
+</body>
+</html>

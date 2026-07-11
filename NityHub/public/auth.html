@@ -1,0 +1,97 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NityHub | Access</title>
+  <link rel="stylesheet" href="/css/app.css" />
+</head>
+<body>
+  <main class="auth-wrap">
+    <section class="auth-shell">
+      <div class="auth-brand">
+        <div class="brand-lockup">
+          <div class="brand-badge">NH</div>
+          <div class="brand-copy">
+            <div class="brand-name">NityHub</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="auth-card">
+        <div id="page-notice" class="notice hidden"></div>
+
+        <div class="auth-card-layout">
+          <div class="auth-switcher-panel">
+            <div class="auth-text-tabs">
+              <a id="tab-login" href="#login" class="auth-text-tab active">Login</a>
+              <a id="tab-signup" href="#signup" class="auth-text-tab">Sign Up</a>
+              <a id="tab-reset" href="#reset" class="auth-text-tab">Reset</a>
+            </div>
+          </div>
+
+          <div class="auth-form-panel">
+            <form id="form-login" class="stack">
+              <div class="field">
+                <label for="login-email">Email</label>
+                <input id="login-email" name="email" type="email" placeholder="you@example.com" required />
+              </div>
+              <div class="field">
+                <label for="login-password">Password</label>
+                <input id="login-password" name="password" type="password" placeholder="Enter your password" required />
+              </div>
+              <button id="login-submit-btn" class="btn primary" type="submit">Log In</button>
+            </form>
+
+            <form id="form-signup" class="stack hidden">
+              <div class="field">
+                <label for="signup-username">Username</label>
+                <input id="signup-username" name="username" type="text" placeholder="Choose a username" required />
+              </div>
+              <div class="field">
+                <label for="signup-email">Email</label>
+                <input id="signup-email" name="email" type="email" placeholder="you@example.com" required />
+              </div>
+              <div class="field">
+                <label for="signup-phone">Phone</label>
+                <input id="signup-phone" name="phone" type="text" placeholder="0XXXXXXXXX" required />
+              </div>
+              <div class="field">
+                <label for="signup-password">Password</label>
+                <input id="signup-password" name="password" type="password" placeholder="Create a password" required />
+              </div>
+              <div class="field">
+                <label for="signup-confirm">Confirm Password</label>
+                <input id="signup-confirm" name="confirmPassword" type="password" placeholder="Repeat your password" required />
+              </div>
+              <button id="signup-submit-btn" class="btn primary" type="submit">Create Account</button>
+            </form>
+
+            <form id="form-reset" class="stack hidden">
+              <div class="field">
+                <label for="reset-email">Email</label>
+                <input id="reset-email" name="email" type="email" placeholder="you@example.com" required />
+              </div>
+              <button class="btn primary" type="submit">Send Reset Link</button>
+            </form>
+
+            <div class="row wrap auth-footer-row" style="margin-top: 14px;">
+              <a class="btn subtle" href="/index.html">Back to Dashboard</a>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+  <script src="/js/bootstrap.js?v=render-api-20260321"></script>
+  <script src="/js/config.js?v=render-api-20260321"></script>
+  <script src="/js/firebase.js"></script>
+  <script src="/js/common.js"></script>
+  <script src="/js/auth.js"></script>
+</body>
+</html>
