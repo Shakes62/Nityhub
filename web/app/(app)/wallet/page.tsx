@@ -2,21 +2,23 @@
 
 import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Loader2 } from "lucide-react";
+import { ArrowDownLeft, ArrowUpRight, Loader2 } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { formatDate, formatMoney, shortRef } from "@/lib/format";
 import type { WalletData } from "@/types/models";
 import { creditDeposit, getWalletData, initiatePayment } from "@/services/api";
 import { useAuth } from "@/contexts/auth-context";
 import { useToast } from "@/contexts/toast-context";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardHeader } from "@/components/ui/card";
 import { Field, Input } from "@/components/ui/field";
 import { PageHero } from "@/components/layout/page-hero";
+import { LedgerPanel } from "@/components/ui/ledger-panel";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/ui/states";
 import { Table, TableWrap, Td, Th } from "@/components/ui/table";
+
+const QUICK_AMOUNTS = ["10", "20", "50", "100"];
 
 function WalletInner() {
   const router = useRouter();
@@ -97,29 +99,50 @@ function WalletInner() {
 
   return (
     <>
-      <PageHero title="Wallet" description="Fund your balance and review activity.">
-        <Badge tone="success">
-          Balance · {wallet ? formatMoney(wallet.balance) : "…"}
-        </Badge>
-      </PageHero>
+      <PageHero title="Wallet" description="Fund your balance and review activity." />
+
+      <LedgerPanel
+        label="Wallet Balance"
+        value={wallet ? formatMoney(wallet.balance) : ""}
+        meta="Available now"
+        loading={wallet === null}
+      />
 
       <Card className="flex flex-col gap-4">
         <CardHeader title="Deposit" description="Top up securely with Paystack." />
         <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
           <Field label="Deposit Amount" htmlFor="deposit-amount" className="sm:max-w-xs">
-            <Input
-              id="deposit-amount"
-              type="number"
-              min={1}
-              step="0.01"
-              placeholder="50.00"
-              value={amount}
-              onChange={(event) => setAmount(event.target.value)}
-            />
+            <div className="relative">
+              <span className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-sm font-medium text-muted">
+                GHS
+              </span>
+              <Input
+                id="deposit-amount"
+                type="number"
+                min={1}
+                step="0.01"
+                placeholder="50.00"
+                value={amount}
+                onChange={(event) => setAmount(event.target.value)}
+                className="pl-12 tabular"
+              />
+            </div>
           </Field>
           <Button onClick={startDeposit} loading={depositing}>
             Deposit with Paystack
           </Button>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {QUICK_AMOUNTS.map((value) => (
+            <button
+              key={value}
+              type="button"
+              onClick={() => setAmount(value)}
+              className="rounded-full border border-transparent bg-surface-muted px-3.5 py-1.5 text-sm font-medium tabular text-ink-soft transition-colors hover:border-border-strong"
+            >
+              {value}
+            </button>
+          ))}
         </div>
       </Card>
 
@@ -137,48 +160,111 @@ function WalletInner() {
             description="Deposits and purchases will show up here."
           />
         ) : (
-          <TableWrap>
-            <Table>
-              <thead>
-                <tr>
-                  <Th>Reference</Th>
-                  <Th>Type</Th>
-                  <Th>Amount</Th>
-                  <Th>Balance After</Th>
-                  <Th>Date</Th>
-                </tr>
-              </thead>
-              <tbody>
-                {transactions.map((tx, index) => {
-                  const value = Number(tx.amount || 0);
-                  const credit = value >= 0;
-                  const reference = tx.reference || tx.details?.reference || "-";
-                  return (
-                    <tr key={index} className="hover:bg-surface-soft">
-                      <Td className="font-medium text-ink" title={reference}>
-                        {shortRef(reference)}
-                      </Td>
-                      <Td>{tx.type || "transaction"}</Td>
-                      <Td>
-                        <span
-                          className={cn(
-                            "font-medium",
-                            credit ? "text-success" : "text-danger",
-                          )}
+          <>
+            {/* Desktop table */}
+            <TableWrap className="hidden md:block">
+              <Table>
+                <thead>
+                  <tr>
+                    <Th>Reference</Th>
+                    <Th>Type</Th>
+                    <Th>Amount</Th>
+                    <Th>Balance After</Th>
+                    <Th>Date</Th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {transactions.map((tx, index) => {
+                    const value = Number(tx.amount || 0);
+                    const credit = value >= 0;
+                    const reference = tx.reference || tx.details?.reference || "-";
+                    const DirIcon = credit ? ArrowDownLeft : ArrowUpRight;
+                    return (
+                      <tr key={index} className="transition-colors duration-100 hover:bg-surface-soft/60">
+                        <Td
+                          className="font-mono text-[0.8125rem] font-medium text-ink"
+                          title={reference}
                         >
-                          {credit
-                            ? `+${formatMoney(value)}`
-                            : `-${formatMoney(Math.abs(value))}`}
-                        </span>
-                      </Td>
-                      <Td>{formatMoney(tx.balance || 0)}</Td>
-                      <Td>{formatDate(tx.timestamp)}</Td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </Table>
-          </TableWrap>
+                          {shortRef(reference)}
+                        </Td>
+                        <Td>
+                          <span className="inline-flex items-center gap-1.5">
+                            <DirIcon
+                              className={cn(
+                                "size-3.5",
+                                credit ? "text-success" : "text-muted",
+                              )}
+                              aria-hidden
+                            />
+                            {tx.type || "transaction"}
+                          </span>
+                        </Td>
+                        <Td>
+                          <span
+                            className={cn(
+                              "font-medium tabular",
+                              credit ? "text-success" : "text-ink",
+                            )}
+                          >
+                            {credit
+                              ? `+${formatMoney(value)}`
+                              : `−${formatMoney(Math.abs(value))}`}
+                          </span>
+                        </Td>
+                        <Td className="tabular">{formatMoney(tx.balance || 0)}</Td>
+                        <Td>{formatDate(tx.timestamp)}</Td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </Table>
+            </TableWrap>
+
+            {/* Mobile stacked cards */}
+            <div className="flex flex-col gap-2 md:hidden">
+              {transactions.map((tx, index) => {
+                const value = Number(tx.amount || 0);
+                const credit = value >= 0;
+                const reference = tx.reference || tx.details?.reference || "-";
+                const DirIcon = credit ? ArrowDownLeft : ArrowUpRight;
+                return (
+                  <div
+                    key={index}
+                    className="rounded-lg border border-border bg-surface-soft p-3.5"
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="inline-flex items-center gap-1.5 text-sm text-ink-soft">
+                        <DirIcon
+                          className={cn(
+                            "size-3.5",
+                            credit ? "text-success" : "text-muted",
+                          )}
+                          aria-hidden
+                        />
+                        {tx.type || "transaction"}
+                      </span>
+                      <span
+                        className={cn(
+                          "text-sm font-semibold tabular",
+                          credit ? "text-success" : "text-ink",
+                        )}
+                      >
+                        {credit
+                          ? `+${formatMoney(value)}`
+                          : `−${formatMoney(Math.abs(value))}`}
+                      </span>
+                    </div>
+                    <div className="mt-1.5 flex items-center justify-between gap-3 text-xs text-muted">
+                      <span className="truncate font-mono" title={reference}>
+                        {shortRef(reference)}
+                      </span>
+                      <span className="tabular">{formatDate(tx.timestamp)}</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </>
         )}
       </Card>
     </>

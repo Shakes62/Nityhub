@@ -1,60 +1,71 @@
 @import "tailwindcss";
 
 /* ---------------------------------------------------------------------------
-   NityHub design system
-   Clean, modern, light SaaS palette. Tokens are exposed to Tailwind v4 via
-   @theme so they generate utilities (bg-surface, text-muted, rounded-card…).
+   NityHub — "Jade Ledger" design system
+   Deep jade identity for a money + data app. Tokens are the single source of
+   truth (Tailwind v4 @theme generates the utilities). No hardcoded hex in
+   components.
 --------------------------------------------------------------------------- */
 @theme {
   /* Surfaces */
-  --color-canvas: #f4f6fb;
+  --color-canvas: #f5f7f6;
   --color-surface: #ffffff;
-  --color-surface-muted: #f1f4f9;
-  --color-surface-soft: #f8fafc;
+  --color-surface-muted: #eff3f1;
+  --color-surface-soft: #f9fbfa;
+
+  /* The Ledger Panel (signature dark surface) */
+  --color-ledger: #06442f;
+  --color-ledger-deep: #032b1e;
+  --color-ledger-line: rgba(255, 255, 255, 0.07);
+  --color-ledger-ink: #ffffff;
+  --color-ledger-muted: #9fd4be;
 
   /* Borders */
-  --color-border: #e6eaf1;
-  --color-border-strong: #d3dae6;
+  --color-border: #e2e9e5;
+  --color-border-strong: #cbd7d0;
 
   /* Text */
-  --color-ink: #0f1729;
-  --color-ink-soft: #414d63;
-  --color-muted: #66748c;
+  --color-ink: #0d1b15;
+  --color-ink-soft: #3e4f47;
+  --color-muted: #6b7c73;
 
-  /* Brand */
-  --color-brand: #2563eb;
-  --color-brand-strong: #1d4ed8;
-  --color-brand-soft: #eef4ff;
+  /* Brand — jade */
+  --color-brand: #00a76f;
+  --color-brand-strong: #008558;
+  --color-brand-soft: #e4f6ee;
   --color-brand-ink: #ffffff;
 
   /* Semantic */
-  --color-success: #067a4e;
-  --color-success-soft: #e7f7ef;
-  --color-warning: #b25b09;
-  --color-warning-soft: #fff4e2;
-  --color-danger: #c8383f;
-  --color-danger-soft: #fdecee;
-  --color-info: #1d64c9;
-  --color-info-soft: #eaf2ff;
+  --color-success: #12855f;
+  --color-success-soft: #e4f6ee;
+  --color-warning: #b45309;
+  --color-warning-soft: #fef3e2;
+  --color-danger: #d92d20;
+  --color-danger-soft: #feeceb;
+  --color-info: #175cd3;
+  --color-info-soft: #eaf1fd;
 
   /* Radii */
-  --radius-card: 18px;
-  --radius-lg: 14px;
-  --radius-md: 10px;
-  --radius-sm: 8px;
+  --radius-card: 20px;
+  --radius-lg: 16px;
+  --radius-md: 12px;
+  --radius-sm: 9px;
 
-  /* Shadows */
-  --shadow-xs: 0 1px 2px rgba(16, 24, 40, 0.05);
-  --shadow-sm: 0 6px 16px rgba(24, 40, 72, 0.06);
-  --shadow-md: 0 14px 34px rgba(24, 40, 72, 0.09);
-  --shadow-lg: 0 22px 50px rgba(24, 40, 72, 0.12);
-
-  /* Typography */
-  --font-sans: var(--font-outfit), ui-sans-serif, system-ui, -apple-system,
-    "Segoe UI", Roboto, sans-serif;
+  /* Shadows — soft, green-tinted */
+  --shadow-xs: 0 1px 2px rgba(13, 27, 21, 0.05);
+  --shadow-sm: 0 2px 6px rgba(13, 27, 21, 0.06);
+  --shadow-md: 0 8px 20px rgba(13, 27, 21, 0.08);
+  --shadow-lg: 0 20px 44px rgba(6, 68, 47, 0.14);
+  --shadow-ledger: 0 18px 40px rgba(6, 68, 47, 0.28);
 
   /* Layout */
-  --spacing-sidebar: 17rem;
+  --spacing-sidebar: 17.5rem;
+
+  /* Typography */
+  --font-sans: var(--font-poppins), ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, sans-serif;
+  --font-mono: var(--font-plex-mono), ui-monospace, SFMono-Regular, "SF Mono",
+    Menlo, monospace;
 }
 
 @layer base {
@@ -64,12 +75,10 @@
 
   body {
     background:
-      radial-gradient(circle at top left, rgba(37, 99, 235, 0.07), transparent 30%),
-      radial-gradient(circle at top right, rgba(6, 122, 78, 0.05), transparent 26%),
-      linear-gradient(180deg, #fbfcfe 0%, var(--color-canvas) 60%);
+      radial-gradient(52rem 30rem at 85% -8%, rgba(0, 167, 111, 0.055), transparent 60%),
+      var(--color-canvas);
     color: var(--color-ink);
     font-family: var(--font-sans);
-    font-feature-settings: "cv11", "ss01";
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
   }
@@ -77,12 +86,17 @@
   :focus-visible {
     outline: 2px solid var(--color-brand);
     outline-offset: 2px;
-    border-radius: 4px;
+    border-radius: 6px;
   }
 }
 
 @layer utilities {
-  /* Hide scrollbars while keeping scroll (matches original UX). */
+  /* Tabular figures for every money value / count / balance. */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Hide scrollbars while keeping scroll. */
   .no-scrollbar {
     scrollbar-width: none;
     -ms-overflow-style: none;
@@ -93,6 +107,15 @@
     display: none;
   }
 
+  /* Custom select chevron (currentColor, muted). */
+  .select-chevron {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%236b7c73' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.75rem center;
+    background-size: 1rem;
+  }
+
+  /* Skeleton shimmer. */
   @keyframes shimmer {
     100% {
       transform: translateX(100%);
@@ -102,6 +125,7 @@
     animation: shimmer 1.6s infinite;
   }
 
+  /* Toast entrance. */
   @keyframes toast-in {
     from {
       opacity: 0;
@@ -114,5 +138,59 @@
   }
   .animate-toast-in {
     animation: toast-in 0.2s ease-out;
+  }
+
+  /* Selection check pop-in (package cards). */
+  @keyframes pop-in {
+    from {
+      opacity: 0;
+      transform: scale(0.8);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+  .animate-pop {
+    animation: pop-in 0.12s ease-out;
+  }
+
+  /* Orchestrated page entrance: first children fade/rise with a small stagger. */
+  @keyframes page-rise {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  .stagger-children > * {
+    animation: page-rise 0.2s ease-out both;
+  }
+  .stagger-children > *:nth-child(1) {
+    animation-delay: 0ms;
+  }
+  .stagger-children > *:nth-child(2) {
+    animation-delay: 40ms;
+  }
+  .stagger-children > *:nth-child(3) {
+    animation-delay: 80ms;
+  }
+  .stagger-children > *:nth-child(4) {
+    animation-delay: 120ms;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .animate-shimmer::after,
+    .animate-toast-in,
+    .animate-pop,
+    .stagger-children > * {
+      animation: none !important;
+    }
+    .animate-toast-in {
+      opacity: 1;
+    }
   }
 }

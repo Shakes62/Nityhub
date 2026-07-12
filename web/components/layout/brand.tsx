@@ -10,7 +10,7 @@ export function Brand({
 }) {
   return (
     <div className={cn("flex items-center gap-3", className)}>
-      <div className="flex size-10 items-center justify-center rounded-xl bg-brand text-sm font-bold text-brand-ink shadow-sm">
+      <div className="flex size-10 items-center justify-center rounded-xl bg-ledger text-sm font-semibold text-ledger-ink shadow-sm">
         NH
       </div>
       <div className="leading-tight">

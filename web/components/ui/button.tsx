@@ -6,15 +6,17 @@ export type ButtonVariant = "primary" | "secondary" | "subtle" | "ghost" | "dang
 export type ButtonSize = "sm" | "md" | "lg";
 
 const BASE =
-  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-lg font-medium " +
-  "transition-colors duration-150 focus-visible:outline-none focus-visible:ring-2 " +
-  "focus-visible:ring-brand/40 disabled:pointer-events-none disabled:opacity-55 " +
-  "aria-busy:cursor-progress select-none";
+  "inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-lg font-semibold " +
+  "transition-[background-color,transform,box-shadow] duration-150 select-none " +
+  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/35 focus-visible:ring-offset-2 " +
+  "active:scale-[0.98] disabled:pointer-events-none disabled:opacity-55 aria-busy:cursor-progress " +
+  "motion-reduce:transition-none motion-reduce:active:scale-100";
 
 const VARIANTS: Record<ButtonVariant, string> = {
-  primary: "bg-brand text-brand-ink shadow-xs hover:bg-brand-strong",
+  primary: "bg-brand text-brand-ink shadow-sm hover:bg-brand-strong hover:shadow-md",
   secondary: "border border-border-strong bg-surface text-ink hover:bg-surface-muted",
-  subtle: "bg-surface-muted text-ink-soft hover:bg-border",
+  subtle:
+    "border border-transparent bg-surface-muted text-ink-soft hover:border-border-strong",
   ghost: "text-ink-soft hover:bg-surface-muted",
   danger: "bg-danger text-white hover:brightness-95",
 };

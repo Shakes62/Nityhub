@@ -22,12 +22,11 @@ export function EmptyState({
   return (
     <div
       className={cn(
-        "flex flex-col items-center justify-center gap-3 rounded-lg border border-dashed",
-        "border-border-strong bg-surface-soft px-6 py-10 text-center",
+        "flex flex-col items-center justify-center gap-3 rounded-lg bg-surface-soft px-6 py-10 text-center",
         className,
       )}
     >
-      <div className="flex size-11 items-center justify-center rounded-full bg-surface-muted text-muted">
+      <div className="flex size-12 items-center justify-center rounded-full bg-brand-soft text-brand-strong">
         {icon ?? <Inbox className="size-5" />}
       </div>
       <div>
@@ -53,12 +52,14 @@ export function ErrorState({ message, onRetry, className }: ErrorStateProps) {
     <div
       role="alert"
       className={cn(
-        "flex flex-col items-center justify-center gap-3 rounded-lg border border-danger/25",
+        "flex flex-col items-center justify-center gap-3 rounded-lg border border-danger/20",
         "bg-danger-soft px-6 py-8 text-center",
         className,
       )}
     >
-      <AlertCircle className="size-6 text-danger" />
+      <div className="flex size-12 items-center justify-center rounded-full bg-danger/10 text-danger">
+        <AlertCircle className="size-5" />
+      </div>
       <p className="text-sm font-medium text-ink">{message}</p>
       {onRetry ? (
         <Button variant="secondary" size="sm" onClick={onRetry}>

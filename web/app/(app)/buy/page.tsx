@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import { CheckCircle2 } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { formatMoney, normalizePhone } from "@/lib/format";
 import { NETWORKS } from "@/constants/networks";
@@ -19,6 +20,7 @@ import { Card, CardHeader } from "@/components/ui/card";
 import { Field, Select } from "@/components/ui/field";
 import { Input } from "@/components/ui/field";
 import { PageHero } from "@/components/layout/page-hero";
+import { NetworkDot } from "@/components/ui/network-dot";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState, ErrorState } from "@/components/ui/states";
 
@@ -204,7 +206,7 @@ export default function BuyPage() {
         {loadingPackages ? (
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {Array.from({ length: 6 }).map((_, index) => (
-              <Skeleton key={index} className="h-20 rounded-lg" />
+              <Skeleton key={index} className="h-[4.5rem] rounded-lg" />
             ))}
           </div>
         ) : packagesError ? (
@@ -228,21 +230,20 @@ export default function BuyPage() {
                   onClick={() => setSelectedId(item.id)}
                   aria-pressed={active}
                   className={cn(
-                    "flex flex-col items-start gap-1 rounded-lg border p-4 text-left transition-all",
+                    "relative flex flex-col items-start gap-1 rounded-lg border p-4 text-left transition-all duration-150",
+                    "active:scale-[0.98] motion-reduce:transition-none motion-reduce:active:scale-100",
                     active
                       ? "border-brand bg-brand-soft ring-2 ring-brand/30"
-                      : "border-border bg-surface hover:border-border-strong hover:bg-surface-soft",
+                      : "border-border bg-surface hover:border-border-strong hover:shadow-sm",
                   )}
                 >
+                  {active ? (
+                    <CheckCircle2 className="absolute right-3 top-3 size-4 animate-pop text-brand" />
+                  ) : null}
                   <span className="text-base font-semibold text-ink">
                     {item.label}
                   </span>
-                  <span
-                    className={cn(
-                      "text-sm font-medium",
-                      active ? "text-brand-strong" : "text-muted",
-                    )}
-                  >
+                  <span className="text-sm font-semibold tabular text-brand-strong">
                     {formatMoney(item.price)}
                   </span>
                 </button>
@@ -252,13 +253,20 @@ export default function BuyPage() {
         )}
 
         <div className="flex flex-wrap items-center gap-3 border-t border-border pt-4">
-          <Button onClick={handlePurchase} loading={submitting} disabled={!selected}>
+          <Button
+            onClick={handlePurchase}
+            loading={submitting}
+            disabled={!selected}
+            size="lg"
+            className="w-full sm:w-auto"
+          >
             Buy Bundle
           </Button>
           {selected ? (
-            <span className="text-sm text-muted">
+            <span className="inline-flex items-center gap-1.5 text-sm text-muted">
+              <NetworkDot network={network} />
               {selected.label} · {formatMoney(selected.price)} to{" "}
-              {phone ? normalizePhone(phone) : "—"}
+              <span className="font-mono">{phone ? normalizePhone(phone) : "—"}</span>
             </span>
           ) : null}
         </div>

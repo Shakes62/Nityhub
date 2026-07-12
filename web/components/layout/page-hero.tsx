@@ -1,5 +1,4 @@
 import type { ReactNode } from "react";
-import { Card } from "@/components/ui/card";
 
 interface PageHeroProps {
   title: string;
@@ -8,13 +7,16 @@ interface PageHeroProps {
   children?: ReactNode;
 }
 
-/** Standard page header card with title, optional description and actions. */
+/**
+ * De-boxed page header: title + description with right-aligned actions, an
+ * optional badges/children row, and a hairline separating it from the content.
+ */
 export function PageHero({ title, description, actions, children }: PageHeroProps) {
   return (
-    <Card className="bg-gradient-to-br from-surface to-brand-soft/40">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+    <div className="border-b border-border pb-5">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0">
-          <h1 className="text-xl font-semibold tracking-tight text-ink sm:text-2xl">
+          <h1 className="text-[1.75rem] font-semibold leading-tight tracking-tight text-ink">
             {title}
           </h1>
           {description ? (
@@ -26,6 +28,6 @@ export function PageHero({ title, description, actions, children }: PageHeroProp
         ) : null}
       </div>
       {children ? <div className="mt-4">{children}</div> : null}
-    </Card>
+    </div>
   );
 }

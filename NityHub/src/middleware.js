@@ -2,7 +2,6 @@ import express from "express"
 import cors from "cors"
 import compression from "compression"
 import helmet from "helmet"
-import fs from "fs"
 import { CONFIG } from "./config.js"
 import { logger } from "./logger.js"
 
@@ -192,9 +191,9 @@ function validateRequestSignature(req, res, next) {
 /**
  * Install the base middleware stack on the app, in the exact original order:
  * helmet → compression → CORS → JSON/urlencoded body parsing → security
- * headers → global rate limit → transaction signature validation → static.
+ * headers → global rate limit → transaction signature validation.
  */
-export function installBaseMiddleware(app, publicDir) {
+export function installBaseMiddleware(app) {
   app.set("trust proxy", 1)
   app.use(
     helmet({
@@ -246,21 +245,4 @@ export function installBaseMiddleware(app, publicDir) {
   app.use(rateLimit)
 
   app.use(validateRequestSignature)
-
-  if (!fs.existsSync(publicDir)) {
-    fs.mkdirSync(publicDir, { recursive: true })
-  }
-
-  app.use(
-    express.static(publicDir, {
-      maxAge: CONFIG.nodeEnv === "production" ? "1d" : "1h",
-      etag: true,
-      lastModified: true,
-      setHeaders: (res, path) => {
-        if (path.endsWith(".html")) {
-          res.setHeader("Cache-Control", "no-cache")
-        }
-      },
-    }),
-  )
 }

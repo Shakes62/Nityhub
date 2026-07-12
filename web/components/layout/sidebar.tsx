@@ -15,14 +15,22 @@ interface SidebarProps {
 
 export function Sidebar({ displayName, onNavigate, onLogout }: SidebarProps) {
   const pathname = usePathname();
+  const initial = displayName.trim().charAt(0).toUpperCase() || "U";
 
   return (
-    <div className="flex h-full flex-col gap-5 border-r border-border bg-surface/85 px-4 py-5 backdrop-blur-xl">
+    <div className="flex h-full flex-col gap-5 border-r border-border bg-surface px-4 py-5">
       <Brand />
 
-      <div className="rounded-lg border border-border bg-surface-soft p-3">
-        <p className="text-xs text-muted">Signed in as</p>
-        <p className="truncate text-sm font-medium text-ink">{displayName}</p>
+      <div className="flex items-center gap-3 rounded-lg border border-border bg-surface-soft p-3">
+        <span className="flex size-9 shrink-0 items-center justify-center rounded-full bg-brand-soft text-sm font-semibold text-brand-strong">
+          {initial}
+        </span>
+        <div className="min-w-0">
+          <p className="text-[0.6875rem] font-semibold uppercase tracking-[0.08em] text-muted">
+            Signed in as
+          </p>
+          <p className="truncate text-sm font-medium text-ink">{displayName}</p>
+        </div>
       </div>
 
       <nav className="flex flex-1 flex-col gap-1">
@@ -37,20 +45,26 @@ export function Sidebar({ displayName, onNavigate, onLogout }: SidebarProps) {
               onClick={onNavigate}
               aria-current={active ? "page" : undefined}
               className={cn(
-                "group flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm transition-colors",
+                "group relative flex items-center gap-3 rounded-md px-3 py-2.5 text-sm transition-colors",
                 active
                   ? "bg-brand-soft font-medium text-brand-strong"
                   : "text-ink-soft hover:bg-surface-muted",
               )}
             >
+              {active ? (
+                <span
+                  className="absolute left-0 top-1/2 h-5 w-[3px] -translate-y-1/2 rounded-full bg-brand"
+                  aria-hidden
+                />
+              ) : null}
               <Icon
                 className={cn(
-                  "size-5 shrink-0",
+                  "size-[1.125rem] shrink-0",
                   active ? "text-brand" : "text-muted group-hover:text-ink-soft",
                 )}
               />
               <span className="flex-1">{item.label}</span>
-              <span className="text-xs text-muted">{item.meta}</span>
+              <span className="hidden text-xs text-muted xl:inline">{item.meta}</span>
             </Link>
           );
         })}
@@ -59,9 +73,9 @@ export function Sidebar({ displayName, onNavigate, onLogout }: SidebarProps) {
       <button
         type="button"
         onClick={onLogout}
-        className="flex items-center gap-2 rounded-lg border border-border px-3 py-2.5 text-sm text-ink-soft transition-colors hover:bg-surface-muted"
+        className="group flex items-center gap-2 rounded-md px-3 py-2.5 text-sm text-ink-soft transition-colors hover:bg-surface-muted hover:text-danger"
       >
-        <LogOut className="size-4" />
+        <LogOut className="size-4 text-muted group-hover:text-danger" />
         Logout
       </button>
     </div>

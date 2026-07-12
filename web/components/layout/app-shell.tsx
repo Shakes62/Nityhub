@@ -64,9 +64,9 @@ export function AppShell({ children }: { children: ReactNode }) {
   }
 
   return (
-    <div className="min-h-screen lg:pl-[17rem]">
+    <div className="min-h-screen lg:pl-[17.5rem]">
       {/* Desktop sidebar */}
-      <aside className="fixed inset-y-0 left-0 z-30 hidden w-[17rem] lg:block">
+      <aside className="fixed inset-y-0 left-0 z-30 hidden w-[17.5rem] lg:block">
         <Sidebar
           displayName={displayName}
           onNavigate={closeMenu}
@@ -77,7 +77,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       {/* Mobile drawer + overlay */}
       <div
         className={cn(
-          "fixed inset-0 z-40 bg-ink/40 transition-opacity lg:hidden",
+          "fixed inset-0 z-40 bg-ink/45 backdrop-blur-[2px] transition-opacity lg:hidden",
           menuOpen ? "opacity-100" : "pointer-events-none opacity-0",
         )}
         onClick={closeMenu}
@@ -85,7 +85,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       />
       <aside
         className={cn(
-          "fixed inset-y-0 left-0 z-50 w-[17rem] transition-transform duration-300 lg:hidden",
+          "fixed inset-y-0 left-0 z-50 w-[17.5rem] shadow-lg transition-transform duration-300 lg:hidden",
           menuOpen ? "translate-x-0" : "-translate-x-full",
         )}
       >
@@ -97,7 +97,7 @@ export function AppShell({ children }: { children: ReactNode }) {
       </aside>
 
       {/* Mobile header */}
-      <header className="sticky top-0 z-20 flex items-center gap-3 border-b border-border bg-surface/85 px-4 py-3 backdrop-blur-xl lg:hidden">
+      <header className="sticky top-0 z-20 flex items-center gap-3 border-b border-border bg-surface/85 px-4 py-3 backdrop-blur lg:hidden">
         <button
           type="button"
           onClick={() => setMenuOpen(true)}
@@ -113,8 +113,8 @@ export function AppShell({ children }: { children: ReactNode }) {
       </header>
 
       <div className="mx-auto flex min-h-screen w-full max-w-5xl flex-col px-4 py-6 sm:px-6 lg:py-8">
-        <main className="flex flex-1 flex-col gap-5">{children}</main>
-        <footer className="mt-8 border-t border-border pt-5 text-xs text-muted">
+        <main className="stagger-children flex flex-1 flex-col gap-5">{children}</main>
+        <footer className="mt-8 border-t border-border pt-5 text-center text-xs text-muted">
           <span className="font-medium text-ink-soft">NityHub</span> · Reliable data
           and wallet flow
         </footer>

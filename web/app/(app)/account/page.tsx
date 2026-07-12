@@ -75,9 +75,9 @@ export default function AccountPage() {
             <CardHeader title="Profile" description="Update your name and phone." />
             {loading || !data ? (
               <div className="flex flex-col gap-4">
-                <Skeleton className="h-11 rounded-lg" />
-                <Skeleton className="h-11 rounded-lg" />
-                <Skeleton className="h-11 w-36 rounded-lg" />
+                <Skeleton className="h-12 rounded-md" />
+                <Skeleton className="h-12 rounded-md" />
+                <Skeleton className="h-12 w-40 rounded-md" />
               </div>
             ) : (
               // Remounts with fresh defaultValues each time data reloads.
@@ -103,6 +103,7 @@ export default function AccountPage() {
                     defaultValue={data.profile.phone || ""}
                     onBlur={normalizePhoneField}
                     placeholder="0XXXXXXXXX"
+                    className="font-mono"
                   />
                 </Field>
                 <div>
@@ -116,18 +117,37 @@ export default function AccountPage() {
 
           <Card className="flex flex-col gap-4">
             <CardHeader title="Overview" />
-            <dl className="flex flex-col gap-3 text-sm">
+            <div className="flex justify-center pb-1">
+              <span className="flex size-14 items-center justify-center rounded-full bg-brand-soft text-xl font-semibold text-brand-strong">
+                {(
+                  data?.profile.username ||
+                  user?.displayName ||
+                  user?.email ||
+                  "U"
+                )
+                  .trim()
+                  .charAt(0)
+                  .toUpperCase()}
+              </span>
+            </div>
+            <dl className="flex flex-col gap-3">
               <div className="flex items-center justify-between gap-3">
-                <dt className="text-muted">Email</dt>
-                <dd className="truncate font-medium text-ink">{email}</dd>
+                <dt className="text-[0.6875rem] font-semibold uppercase tracking-[0.08em] text-muted">
+                  Email
+                </dt>
+                <dd className="truncate text-sm font-medium text-ink">{email}</dd>
               </div>
               <div className="flex items-center justify-between gap-3 border-t border-border pt-3">
-                <dt className="text-muted">Joined</dt>
-                <dd className="font-medium text-ink">{joined}</dd>
+                <dt className="text-[0.6875rem] font-semibold uppercase tracking-[0.08em] text-muted">
+                  Joined
+                </dt>
+                <dd className="text-sm font-medium text-ink">{joined}</dd>
               </div>
               <div className="flex items-center justify-between gap-3 border-t border-border pt-3">
-                <dt className="text-muted">Wallet</dt>
-                <dd className="font-medium text-ink">
+                <dt className="text-[0.6875rem] font-semibold uppercase tracking-[0.08em] text-muted">
+                  Wallet
+                </dt>
+                <dd className="text-sm font-medium tabular text-ink">
                   {loading ? "…" : formatMoney(data?.balance)}
                 </dd>
               </div>

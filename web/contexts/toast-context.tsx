@@ -47,6 +47,12 @@ const ACCENTS: Record<ToastKind, string> = {
   info: "text-info",
 };
 
+const RAILS: Record<ToastKind, string> = {
+  success: "bg-brand",
+  error: "bg-danger",
+  info: "bg-info",
+};
+
 /**
  * App-wide toast system. Replaces the original Notyf + inline "page-notice"
  * mechanism with an accessible, self-contained implementation (no external CDN
@@ -97,10 +103,14 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               key={toast.id}
               role={toast.kind === "error" ? "alert" : "status"}
               className={cn(
-                "pointer-events-auto flex items-start gap-3 rounded-lg border border-border",
-                "bg-surface p-3.5 shadow-md animate-toast-in",
+                "pointer-events-auto relative flex items-start gap-3 overflow-hidden rounded-lg border border-border",
+                "bg-surface p-3.5 pl-4 shadow-md animate-toast-in",
               )}
             >
+              <span
+                className={cn("absolute inset-y-0 left-0 w-1", RAILS[toast.kind])}
+                aria-hidden
+              />
               <Icon className={cn("mt-0.5 size-5 shrink-0", ACCENTS[toast.kind])} />
               <p className="flex-1 text-sm leading-snug text-ink">{toast.message}</p>
               <button

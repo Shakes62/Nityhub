@@ -1,6 +1,4 @@
 import express from "express"
-import { fileURLToPath } from "url"
-import path from "path"
 
 import { CONFIG } from "./src/config.js"
 import { logger } from "./src/logger.js"
@@ -26,13 +24,10 @@ import {
 } from "./src/domain.js"
 import { runOrderStatusReconciliation } from "./src/providers-sync.js"
 
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
-
 const app = express()
 app.disable("x-powered-by")
 
-installBaseMiddleware(app, path.join(__dirname, "public"))
+installBaseMiddleware(app)
 registerRoutes(app)
 
 // Enhanced cleanup with better error handling

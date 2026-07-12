@@ -8,9 +8,9 @@ import {
 import { cn } from "@/lib/cn";
 
 const CONTROL =
-  "h-11 w-full rounded-lg border border-border bg-surface px-3.5 text-sm text-ink " +
-  "shadow-xs transition-colors placeholder:text-muted focus:border-brand " +
-  "focus:outline-none focus:ring-2 focus:ring-brand/30 disabled:opacity-60";
+  "h-12 w-full rounded-md border border-border bg-surface px-3.5 text-sm text-ink " +
+  "transition-colors placeholder:text-muted focus:border-brand focus:outline-none " +
+  "focus:ring-2 focus:ring-brand/25 disabled:opacity-60";
 
 interface FieldProps {
   label: ReactNode;
@@ -49,7 +49,11 @@ export const Select = forwardRef<
   SelectHTMLAttributes<HTMLSelectElement>
 >(function Select({ className, ...props }, ref) {
   return (
-    <select ref={ref} className={cn(CONTROL, "appearance-none pr-9", className)} {...props} />
+    <select
+      ref={ref}
+      className={cn(CONTROL, "select-chevron appearance-none pr-9", className)}
+      {...props}
+    />
   );
 });
 

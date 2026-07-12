@@ -135,6 +135,10 @@ export default function AuthPage() {
             ))}
           </div>
 
+          <div
+            key={tab}
+            className="animate-[page-rise_0.15s_ease-out] motion-reduce:animate-none"
+          >
           {tab === "login" && (
             <form onSubmit={handleLogin} className="flex flex-col gap-4">
               <Field label="Email" htmlFor="login-email">
@@ -157,7 +161,7 @@ export default function AuthPage() {
                   required
                 />
               </Field>
-              <Button type="submit" fullWidth loading={submitting}>
+              <Button type="submit" size="lg" fullWidth loading={submitting}>
                 Log In
               </Button>
             </form>
@@ -216,7 +220,7 @@ export default function AuthPage() {
                   required
                 />
               </Field>
-              <Button type="submit" fullWidth loading={submitting}>
+              <Button type="submit" size="lg" fullWidth loading={submitting}>
                 Create Account
               </Button>
             </form>
@@ -238,11 +242,12 @@ export default function AuthPage() {
                   required
                 />
               </Field>
-              <Button type="submit" fullWidth loading={submitting}>
+              <Button type="submit" size="lg" fullWidth loading={submitting}>
                 Send Reset Link
               </Button>
             </form>
           )}
+          </div>
 
           <div className="mt-6 text-center text-sm text-muted">
             <Link href="/dashboard" className="font-medium text-brand hover:underline">

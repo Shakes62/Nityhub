@@ -14,18 +14,15 @@ interface StatProps {
 export function Stat({ label, value, meta, loading, className }: StatProps) {
   return (
     <div
-      className={cn(
-        "rounded-lg border border-border bg-surface-soft p-4",
-        className,
-      )}
+      className={cn("rounded-lg border border-border bg-surface-soft p-4", className)}
     >
-      <p className="text-xs font-medium uppercase tracking-wide text-muted">
+      <p className="text-[0.6875rem] font-semibold uppercase leading-[1.3] tracking-[0.08em] text-muted">
         {label}
       </p>
       {loading ? (
-        <Skeleton className="mt-2 h-7 w-24" />
+        <Skeleton className="mt-2 h-8 w-24 rounded-md" />
       ) : (
-        <p className="mt-1.5 text-2xl font-semibold tracking-tight text-ink">
+        <p className="mt-1.5 text-2xl font-semibold tracking-tight tabular text-ink">
           {value}
         </p>
       )}

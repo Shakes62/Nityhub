@@ -109,6 +109,7 @@ export default function AfaPage() {
                 type="tel"
                 inputMode="numeric"
                 placeholder="0XXXXXXXXX"
+                className="font-mono"
                 required
               />
             </Field>
@@ -118,14 +119,14 @@ export default function AfaPage() {
               <Input id="afa-dob" name="dob" type="date" required />
             </Field>
             <Field label="Ghana Card" htmlFor="afa-card">
-              <Input id="afa-card" name="ghanaCard" type="text" required />
+              <Input id="afa-card" name="ghanaCard" type="text" className="font-mono" required />
             </Field>
           </div>
           <Field label="Location" htmlFor="afa-location">
             <Input id="afa-location" name="location" type="text" required />
           </Field>
-          <div>
-            <Button type="submit" loading={submitting}>
+          <div className="sm:flex sm:justify-end">
+            <Button type="submit" loading={submitting} className="w-full sm:w-auto">
               Submit Registration
             </Button>
           </div>
@@ -146,30 +147,60 @@ export default function AfaPage() {
             description="Completed AFA registrations will appear here."
           />
         ) : (
-          <TableWrap>
-            <Table>
-              <thead>
-                <tr>
-                  <Th>Name</Th>
-                  <Th>Phone</Th>
-                  <Th>Location</Th>
-                  <Th>Fee</Th>
-                  <Th>Date</Th>
-                </tr>
-              </thead>
-              <tbody>
-                {registrations.map((row, index) => (
-                  <tr key={index} className="hover:bg-surface-soft">
-                    <Td className="font-medium text-ink">{row.fullname || "-"}</Td>
-                    <Td>{row.phone || "-"}</Td>
-                    <Td>{row.location || "-"}</Td>
-                    <Td>{formatMoney(row.fee || 0)}</Td>
-                    <Td>{formatDate(row.timestamp)}</Td>
+          <>
+            {/* Desktop table */}
+            <TableWrap className="hidden md:block">
+              <Table>
+                <thead>
+                  <tr>
+                    <Th>Name</Th>
+                    <Th>Phone</Th>
+                    <Th>Location</Th>
+                    <Th>Fee</Th>
+                    <Th>Date</Th>
                   </tr>
-                ))}
-              </tbody>
-            </Table>
-          </TableWrap>
+                </thead>
+                <tbody>
+                  {registrations.map((row, index) => (
+                    <tr
+                      key={index}
+                      className="transition-colors duration-100 hover:bg-surface-soft/60"
+                    >
+                      <Td className="font-medium text-ink">{row.fullname || "-"}</Td>
+                      <Td className="font-mono text-[0.8125rem]">{row.phone || "-"}</Td>
+                      <Td>{row.location || "-"}</Td>
+                      <Td className="tabular">{formatMoney(row.fee || 0)}</Td>
+                      <Td>{formatDate(row.timestamp)}</Td>
+                    </tr>
+                  ))}
+                </tbody>
+              </Table>
+            </TableWrap>
+
+            {/* Mobile stacked cards */}
+            <div className="flex flex-col gap-2 md:hidden">
+              {registrations.map((row, index) => (
+                <div
+                  key={index}
+                  className="rounded-lg border border-border bg-surface-soft p-3.5"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="font-medium text-ink">{row.fullname || "-"}</span>
+                    <span className="text-sm font-semibold tabular text-ink">
+                      {formatMoney(row.fee || 0)}
+                    </span>
+                  </div>
+                  <div className="mt-1.5 flex items-center justify-between gap-3 text-xs text-muted">
+                    <span className="font-mono">{row.phone || "-"}</span>
+                    <span>{row.location || "-"}</span>
+                  </div>
+                  <div className="mt-1 text-xs tabular text-muted">
+                    {formatDate(row.timestamp)}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </>
         )}
       </Card>
     </>
