@@ -26,6 +26,14 @@ import {
 } from "./lib/http.js"
 import { generateReference } from "./lib/reference.js"
 import {
+  toMoneyNumber,
+  toMoneyUnits,
+  fromMoneyUnits,
+  hashStableKey,
+  sanitizeMutationId,
+  trimWalletMutationHistory,
+} from "./lib/money.js"
+import {
   processedTransactions,
   duplicateAttempts,
   DUPLICATE_ATTEMPT_WINDOW,
@@ -919,28 +927,8 @@ function sanitizeProviderMeta(provider, value = {}) {
   return {}
 }
 
-function toMoneyNumber(value, fallback = 0) {
-  const parsed = Number(value)
-  if (!Number.isFinite(parsed)) {
-    return fallback
-  }
-
-  return Math.round((parsed + Number.EPSILON) * 100) / 100
-}
-
-function toMoneyUnits(value, fallback = 0) {
-  const normalized = toMoneyNumber(value, fallback)
-  return Number.isFinite(normalized) ? Math.round(normalized * 100) : Math.round(fallback * 100)
-}
-
-function fromMoneyUnits(value, fallback = 0) {
-  const parsed = Number(value)
-  if (!Number.isFinite(parsed)) {
-    return fallback
-  }
-
-  return Math.round(parsed) / 100
-}
+// Money math now lives in ./lib/money.js — see the import at the top of this
+// module. It is re-exported below so existing call sites keep working.
 
 function sanitizeCatalogId(value, fallback = "package") {
   const source = String(value || fallback).trim().toLowerCase()
@@ -1361,25 +1349,6 @@ function isTransientRealtimeDisconnectError(error) {
   return ["disconnect", "econnreset", "timed out", "timeout", "socket hang up", "network", "connection lost"].some((term) =>
     message.includes(term),
   )
-}
-
-function hashStableKey(value) {
-  return crypto.createHash("sha256").update(String(value || "")).digest("hex").slice(0, 48)
-}
-
-function sanitizeMutationId(value, fallback = "") {
-  const safe = String(value || "").trim().replace(/[^a-zA-Z0-9:_-]/g, "_").slice(0, 120)
-  return safe || String(fallback || "").trim()
-}
-
-function trimWalletMutationHistory(history = {}) {
-  const entries = Object.entries(history || {})
-  if (entries.length <= CONFIG.walletMutationHistoryLimit) {
-    return history
-  }
-
-  entries.sort((a, b) => Number(b?.[1]?.timestamp || 0) - Number(a?.[1]?.timestamp || 0))
-  return Object.fromEntries(entries.slice(0, CONFIG.walletMutationHistoryLimit))
 }
 
 function assertProviderConfigured(provider, context = "runtime") {
