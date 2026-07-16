@@ -6,7 +6,9 @@ import { ArrowDownLeft, ArrowUpRight, Loader2 } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { formatDate, formatMoney, shortRef } from "@/lib/format";
 import type { WalletData } from "@/types/models";
-import { creditDeposit, getWalletData, initiatePayment } from "@/services/api";
+import { creditDeposit, getWalletBalance, getWalletData, initiatePayment } from "@/services/api";
+import { Modal } from "@/components/ui/modal";
+import { Receipt, type ReceiptData } from "@/components/receipt/receipt";
 import { useAuth } from "@/contexts/auth-context";
 import { useToast } from "@/contexts/toast-context";
 import { Button } from "@/components/ui/button";
@@ -17,6 +19,7 @@ import { LedgerPanel } from "@/components/ui/ledger-panel";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/ui/states";
 import { Table, TableWrap, Td, Th } from "@/components/ui/table";
+import { useInfiniteScroll } from "@/hooks/use-infinite-scroll";
 
 const QUICK_AMOUNTS = ["10", "20", "50", "100"];
 
@@ -30,6 +33,7 @@ function WalletInner() {
   const [loading, setLoading] = useState(true);
   const [amount, setAmount] = useState("");
   const [depositing, setDepositing] = useState(false);
+  const [depositReceipt, setDepositReceipt] = useState<ReceiptData | null>(null);
   const callbackHandled = useRef(false);
 
   const refresh = useCallback(async () => {
@@ -43,27 +47,66 @@ function WalletInner() {
     }
   }, [toast]);
 
-  // Initial load + confirm a returning Paystack deposit (reference/trxref).
+  // Initial load + confirm a returning Paystack deposit (reference/trxref),
+  // then present a professional deposit receipt.
   useEffect(() => {
     let active = true;
     (async () => {
-      await refresh();
-      const reference =
-        searchParams.get("reference") || searchParams.get("trxref");
-      if (!active || !reference || callbackHandled.current) {
+      const reference = searchParams.get("reference") || searchParams.get("trxref");
+      if (!reference || callbackHandled.current) {
+        await refresh();
         return;
       }
       callbackHandled.current = true;
       toast.info("Confirming payment...");
+      let before: number | null = null;
+      try {
+        before = await getWalletBalance();
+      } catch {
+        /* balance-before is best-effort */
+      }
       try {
         await creditDeposit(reference);
-        toast.success("Deposit confirmed and added to wallet.");
+        let after: number | null = null;
+        try {
+          after = await getWalletBalance();
+        } catch {
+          /* balance-after is best-effort */
+        }
+        if (!active) return;
+        const credited = before != null && after != null ? Math.max(0, after - before) : 0;
+        setDepositReceipt({
+          kind: "deposit",
+          status: "success",
+          title: "Deposit receipt",
+          reference,
+          date: Date.now(),
+          lines: [{ label: "Channel", value: "Paystack" }],
+          amount: credited,
+          method: "Paystack",
+          balanceBefore: before,
+          balanceAfter: after,
+          estimatedDelivery: "Reflected immediately",
+          note: `Wallet deposit ${formatMoney(credited)}`,
+        });
         router.replace("/wallet");
         await refresh();
       } catch (error) {
-        toast.error(
-          error instanceof Error ? error.message : "Failed to confirm deposit.",
-        );
+        if (!active) return;
+        setDepositReceipt({
+          kind: "deposit",
+          status: "failed",
+          title: "Deposit receipt",
+          reference,
+          date: Date.now(),
+          lines: [
+            { label: "Reason", value: error instanceof Error ? error.message : "Confirmation failed" },
+          ],
+          amount: 0,
+          method: "Paystack",
+          balanceBefore: before,
+          balanceAfter: before,
+        });
       }
     })();
     return () => {
@@ -96,6 +139,7 @@ function WalletInner() {
   }
 
   const transactions = wallet?.transactions ?? [];
+  const { visible, hasMore, sentinelRef } = useInfiniteScroll(transactions, 20);
 
   return (
     <>
@@ -150,8 +194,8 @@ function WalletInner() {
         <CardHeader title="Transactions" />
         {loading ? (
           <div className="flex flex-col gap-2">
-            {Array.from({ length: 5 }).map((_, index) => (
-              <Skeleton key={index} className="h-12 rounded-lg" />
+            {Array.from({ length: 6 }).map((_, index) => (
+              <Skeleton key={index} className="h-11 rounded-lg" />
             ))}
           </div>
         ) : transactions.length === 0 ? (
@@ -161,112 +205,64 @@ function WalletInner() {
           />
         ) : (
           <>
-            {/* Desktop table */}
-            <TableWrap className="hidden md:block">
-              <Table>
-                <thead>
+            <TableWrap>
+              <Table className="min-w-[34rem]">
+                <thead className="sticky top-0 z-10">
                   <tr>
                     <Th>Reference</Th>
                     <Th>Type</Th>
-                    <Th>Amount</Th>
-                    <Th>Balance After</Th>
+                    <Th className="text-right">Amount</Th>
+                    <Th className="text-right">Balance</Th>
                     <Th>Date</Th>
                   </tr>
                 </thead>
                 <tbody>
-                  {transactions.map((tx, index) => {
+                  {visible.map((tx, index) => {
                     const value = Number(tx.amount || 0);
                     const credit = value >= 0;
                     const reference = tx.reference || tx.details?.reference || "-";
                     const DirIcon = credit ? ArrowDownLeft : ArrowUpRight;
                     return (
-                      <tr key={index} className="transition-colors duration-100 hover:bg-surface-soft/60">
-                        <Td
-                          className="font-mono text-[0.8125rem] font-medium text-ink"
-                          title={reference}
-                        >
-                          {shortRef(reference)}
+                      <tr key={index} className="h-11 transition-colors duration-100 hover:bg-surface-soft/60">
+                        <Td className="py-0 font-mono text-[0.8125rem] font-medium text-ink" title={reference}>
+                          {shortRef(reference, 12)}
                         </Td>
-                        <Td>
-                          <span className="inline-flex items-center gap-1.5">
-                            <DirIcon
-                              className={cn(
-                                "size-3.5",
-                                credit ? "text-success" : "text-muted",
-                              )}
-                              aria-hidden
-                            />
+                        <Td className="py-0">
+                          <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
+                            <DirIcon className={cn("size-3.5", credit ? "text-success" : "text-muted")} aria-hidden />
                             {tx.type || "transaction"}
                           </span>
                         </Td>
-                        <Td>
-                          <span
-                            className={cn(
-                              "font-medium tabular",
-                              credit ? "text-success" : "text-ink",
-                            )}
-                          >
-                            {credit
-                              ? `+${formatMoney(value)}`
-                              : `−${formatMoney(Math.abs(value))}`}
-                          </span>
+                        <Td className={cn("py-0 text-right font-medium tabular", credit ? "text-success" : "text-ink")}>
+                          {credit ? `+${formatMoney(value)}` : `−${formatMoney(Math.abs(value))}`}
                         </Td>
-                        <Td className="tabular">{formatMoney(tx.balance || 0)}</Td>
-                        <Td>{formatDate(tx.timestamp)}</Td>
+                        <Td className="py-0 text-right tabular">{formatMoney(tx.balance || 0)}</Td>
+                        <Td className="py-0 whitespace-nowrap">{formatDate(tx.timestamp)}</Td>
                       </tr>
                     );
                   })}
                 </tbody>
               </Table>
             </TableWrap>
-
-            {/* Mobile stacked cards */}
-            <div className="flex flex-col gap-2 md:hidden">
-              {transactions.map((tx, index) => {
-                const value = Number(tx.amount || 0);
-                const credit = value >= 0;
-                const reference = tx.reference || tx.details?.reference || "-";
-                const DirIcon = credit ? ArrowDownLeft : ArrowUpRight;
-                return (
-                  <div
-                    key={index}
-                    className="rounded-lg border border-border bg-surface-soft p-3.5"
-                  >
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="inline-flex items-center gap-1.5 text-sm text-ink-soft">
-                        <DirIcon
-                          className={cn(
-                            "size-3.5",
-                            credit ? "text-success" : "text-muted",
-                          )}
-                          aria-hidden
-                        />
-                        {tx.type || "transaction"}
-                      </span>
-                      <span
-                        className={cn(
-                          "text-sm font-semibold tabular",
-                          credit ? "text-success" : "text-ink",
-                        )}
-                      >
-                        {credit
-                          ? `+${formatMoney(value)}`
-                          : `−${formatMoney(Math.abs(value))}`}
-                      </span>
-                    </div>
-                    <div className="mt-1.5 flex items-center justify-between gap-3 text-xs text-muted">
-                      <span className="truncate font-mono" title={reference}>
-                        {shortRef(reference)}
-                      </span>
-                      <span className="tabular">{formatDate(tx.timestamp)}</span>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
+            {hasMore ? <div ref={sentinelRef} aria-hidden className="h-8" /> : null}
           </>
         )}
       </Card>
+
+      {/* Deposit receipt (Paystack return) */}
+      <Modal
+        open={Boolean(depositReceipt)}
+        onClose={() => setDepositReceipt(null)}
+        title="Deposit"
+        size="sm"
+        footer={
+          <Button variant="primary" size="sm" onClick={() => setDepositReceipt(null)}>
+            Done
+          </Button>
+        }
+      >
+        {depositReceipt ? <Receipt data={depositReceipt} /> : null}
+      </Modal>
     </>
   );
 }

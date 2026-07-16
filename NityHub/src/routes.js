@@ -2329,7 +2329,7 @@ app.post("/api/initiate-payment", authenticateRequest, purchaseActionRateLimit, 
       amount: amountInKobo,
       email: paymentOwnerEmail,
       reference: paymentReference,
-      callback_url: paymentType === "wallet" ? buildFrontendUrl("/wallet.html") : buildFrontendUrl("/buy.html"),
+      callback_url: paymentType === "wallet" ? buildFrontendUrl("/wallet") : buildFrontendUrl("/buy"),
       metadata: {
         paymentType: paymentType || "bundle",
         fcmToken: fcmToken || null,
