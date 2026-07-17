@@ -26,6 +26,7 @@ import {
   gigshubCircuitBreaker,
 } from "./lib/http.js"
 import { generateReference } from "./lib/reference.js"
+import { enqueueRefund } from "./refund-queue.js"
 import {
   processedTransactions,
   duplicateAttempts,
@@ -1769,6 +1770,21 @@ app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, a
           })
         } catch (refundError) {
           logger.error("Wallet refund failed after purchase error", refundError, { userId, reference })
+          // The user is debited and the inline refund just failed. Durably queue
+          // it so the worker keeps retrying instead of the money being lost to
+          // this log line. Retrying is safe: refundMutationId is the wallet
+          // replay guard's key, so it can never refund twice.
+          await enqueueRefund({
+            userId,
+            reference,
+            amount,
+            mutationId: refundMutationId,
+            reason: "wallet_purchase_refund",
+            details: { network, phone, packageId: catalogEntry.id },
+            lastError: refundError?.message || String(refundError),
+          }).catch((queueError) => {
+            logger.error("Refund enqueue failed after refund error", queueError, { userId, reference })
+          })
         }
 
         await createOrderRecord(userId, {

@@ -23,6 +23,7 @@ import {
   isTransientRealtimeDisconnectError,
 } from "./src/domain.js"
 import { runOrderStatusReconciliation } from "./src/providers-sync.js"
+import { runRefundQueue } from "./src/refund-queue.js"
 
 const app = express()
 app.disable("x-powered-by")
@@ -115,6 +116,20 @@ setTimeout(() => {
     logger.error("Initial order reconciliation failed", error)
   })
 }, 5000)
+
+// Drain the refund outbox: retries wallet refunds that failed inline, so a
+// debited user is never left waiting on manual intervention.
+setInterval(() => {
+  runRefundQueue().catch((error) => {
+    logger.error("Scheduled refund queue sweep failed", error)
+  })
+}, CONFIG.refundWorkerIntervalMs)
+
+setTimeout(() => {
+  runRefundQueue().catch((error) => {
+    logger.error("Initial refund queue sweep failed", error)
+  })
+}, 10000)
 
 const server = app.listen(CONFIG.port, "0.0.0.0", () => {
   logger.info(`🚀 DataWise API Server v5.0 running on port ${CONFIG.port}`)

@@ -70,6 +70,15 @@ export const CONFIG = {
   idempotencyWindowMs: Number(process.env.IDEMPOTENCY_WINDOW_MS || 60 * 1000),
   providerSubmissionMaxRetries: Number(process.env.PROVIDER_SUBMISSION_MAX_RETRIES || 0),
   walletMutationHistoryLimit: Number(process.env.WALLET_MUTATION_HISTORY_LIMIT || 120),
+
+  // Refund outbox. A refund that fails inline is durably queued and retried
+  // here rather than being lost to a log line.
+  refundWorkerIntervalMs: Number(process.env.REFUND_WORKER_INTERVAL_MS || 60 * 1000),
+  refundLeaseMs: Number(process.env.REFUND_LEASE_MS || 120 * 1000),
+  refundMaxPerRun: Number(process.env.REFUND_MAX_PER_RUN || 20),
+  refundMaxAttempts: Number(process.env.REFUND_MAX_ATTEMPTS || 10),
+  refundRetryBaseMs: Number(process.env.REFUND_RETRY_BASE_MS || 30 * 1000),
+  refundRetryMaxDelayMs: Number(process.env.REFUND_RETRY_MAX_DELAY_MS || 60 * 60 * 1000),
 }
 
 export const SUPPORTED_PACKAGE_NETWORKS = ["mtn", "at", "telecel"]
@@ -82,6 +91,9 @@ export const DEFAULT_PROVIDER_ROUTING = {
 export const TERMINAL_ORDER_STATUSES = new Set(["delivered", "failed", "cancelled"])
 export const ORDER_SYNC_LEASE_PATH = "system_leases/order_status_reconciler"
 export const ORDER_SYNC_STATE_PATH = "system_sync/order_status"
+export const REFUND_QUEUE_PATH = "refund_queue"
+export const REFUND_DLQ_PATH = "refund_dead_letters"
+export const REFUND_LEASE_PATH = "system_leases/refund_worker"
 export const INSTANCE_ID = crypto.randomBytes(4).toString("hex")
 export const DEFAULT_AFA_REGISTRATION_FEE = 6
 export const PURCHASE_INTENT_PATH = "purchase_intents"
