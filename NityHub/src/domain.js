@@ -33,6 +33,7 @@ import {
   sanitizeMutationId,
   trimWalletMutationHistory,
 } from "./lib/money.js"
+import { computeWalletMutation, WALLET_MUTATION } from "./lib/wallet-core.js"
 import {
   processedTransactions,
   duplicateAttempts,
@@ -1890,55 +1891,34 @@ async function updateWalletBalance(
     let duplicateMutationData = null
 
     const transactionResult = await walletRef.transaction((current) => {
-      const sourceValue = current == null ? initialWalletValue : current
-      const wallet =
-        sourceValue && typeof sourceValue === "object"
-          ? sourceValue
-          : {
-              balance: sourceValue,
-            }
+      // Decision logic lives in ./lib/wallet-core.js so it stays unit testable;
+      // this closure only translates the outcome into RTDB updater semantics.
+      const result = computeWalletMutation(current, {
+        initialWalletValue,
+        deltaUnits,
+        delta,
+        safeMutationId,
+        requireSufficient,
+        reason,
+        reference,
+        details,
+      })
 
-      const appliedMutations =
-        wallet.appliedMutations && typeof wallet.appliedMutations === "object" && !Array.isArray(wallet.appliedMutations)
-          ? wallet.appliedMutations
-          : {}
-      const currentBalance = toMoneyNumber(wallet.balance, 0)
-      const currentBalanceUnits = toMoneyUnits(currentBalance, 0)
-      const nextBalanceUnits = currentBalanceUnits + deltaUnits
-      const nextBalance = fromMoneyUnits(nextBalanceUnits, 0)
-      lastSeenBalance = currentBalance
+      lastSeenBalance = result.currentBalance
 
-      if (safeMutationId && appliedMutations[safeMutationId]) {
+      if (result.outcome === WALLET_MUTATION.DUPLICATE) {
         duplicateMutation = true
-        duplicateMutationData = appliedMutations[safeMutationId]
-        return wallet
+        duplicateMutationData = result.duplicateData
+        return result.wallet
       }
 
-      if (requireSufficient && nextBalanceUnits < 0) {
+      if (result.outcome === WALLET_MUTATION.INSUFFICIENT) {
         rejectedForInsufficient = true
+        // Returning undefined aborts the RTDB transaction.
         return
       }
 
-      const nextAppliedMutations = safeMutationId
-        ? trimWalletMutationHistory({
-            ...appliedMutations,
-            [safeMutationId]: {
-              amount: toMoneyNumber(delta, 0),
-              balance: nextBalance,
-              reference: reference || null,
-              reason: String(reason || "").trim() || null,
-              details: details && typeof details === "object" && !Array.isArray(details) ? details : {},
-              timestamp: Date.now(),
-            },
-          })
-        : appliedMutations
-
-      return {
-        ...wallet,
-        balance: nextBalance,
-        updatedAt: Date.now(),
-        appliedMutations: nextAppliedMutations,
-      }
+      return result.wallet
     })
 
     if (transactionResult.committed) {
