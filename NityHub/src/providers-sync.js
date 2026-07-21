@@ -72,6 +72,7 @@ import {
   normalizeInternalOrderStatus,
   getOrderStatusPriority,
   sanitizeGodswayProviderOrderNumber,
+  extractGodswayOrderNumber,
   resolveStoredProviderOrderNumber,
   resolveStoredProviderReference,
   parseUtcDateBoundary,
@@ -425,14 +426,16 @@ async function processGodswayTransaction(payload) {
       })
     }
 
+    const godswayOrderNumber = extractGodswayOrderNumber(data)
+
     processedTransactions.add(payload.reference, {
       provider: "godsway",
       network: payload.network || null,
       networkKey,
       phone: recipient,
       volume: capacity,
-      providerReference: resolveStoredProviderReference("godsway", data?.data?.orderNumber, payload.reference),
-      providerOrderNumber: resolveStoredProviderOrderNumber("godsway", data?.data?.orderNumber, payload.reference),
+      providerReference: resolveStoredProviderReference("godsway", godswayOrderNumber, payload.reference),
+      providerOrderNumber: resolveStoredProviderOrderNumber("godsway", godswayOrderNumber, payload.reference),
       godswayResponse: data,
       telecelResponse: data,
       processedAt: new Date().toISOString(),
@@ -440,7 +443,7 @@ async function processGodswayTransaction(payload) {
 
     logger.info("Godsway transaction successful", {
       reference: payload.reference,
-      orderNumber: data?.data?.orderNumber || null,
+      orderNumber: godswayOrderNumber || null,
     })
 
     return data
@@ -637,8 +640,9 @@ function createProviderPurchaseMetadata(provider, response, reference, fallbackN
 
   if (provider === "godsway") {
     const statusDetails = getGodswayStatusDetails(response)
-    const providerOrderNumber = resolveStoredProviderOrderNumber("godsway", response?.data?.orderNumber, reference)
-    const providerReference = resolveStoredProviderReference("godsway", response?.data?.orderNumber, reference, providerOrderNumber || "")
+    const godswayOrderNumber = extractGodswayOrderNumber(response)
+    const providerOrderNumber = resolveStoredProviderOrderNumber("godsway", godswayOrderNumber, reference)
+    const providerReference = resolveStoredProviderReference("godsway", godswayOrderNumber, reference, providerOrderNumber || "")
     return {
       provider,
       providerReference,
@@ -647,7 +651,9 @@ function createProviderPurchaseMetadata(provider, response, reference, fallbackN
       providerStatusDescription: statusDetails.providerStatusDescription || "Order accepted by provider",
       providerMeta: sanitizeProviderMeta(provider, response),
       providerResponse: response,
-      status: "accepted",
+      // Trust the status Godsway reported at submit time. Hardcoding "accepted"
+      // left orders that came back SUCCESSFUL waiting on a poll to advance them.
+      status: statusDetails.normalizedStatus || "accepted",
       statusSource: "provider_purchase",
       statusUpdatedAt: now,
       updatedAt: now,
@@ -761,9 +767,10 @@ async function getGodswayOrderStatus(reference) {
   }
 
   const statusDetails = getGodswayStatusDetails(data)
+  const statusOrderNumber = extractGodswayOrderNumber(data)
   const resolvedProviderOrderNumber = resolveStoredProviderOrderNumber(
     "godsway",
-    data?.data?.orderNumber || providerOrderNumber,
+    statusOrderNumber || providerOrderNumber,
     "",
   )
   return {
@@ -771,7 +778,7 @@ async function getGodswayOrderStatus(reference) {
     provider: "godsway",
     providerReference: resolveStoredProviderReference(
       "godsway",
-      data?.data?.orderNumber || "",
+      statusOrderNumber || "",
       "",
       resolvedProviderOrderNumber || "",
     ),

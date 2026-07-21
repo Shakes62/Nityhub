@@ -35,6 +35,11 @@ import {
 } from "./lib/money.js"
 import { computeWalletMutation, WALLET_MUTATION } from "./lib/wallet-core.js"
 import {
+  extractGodswayOrderNumber,
+  sanitizeGodswayProviderOrderNumber,
+  firstNonEmptyText,
+} from "./lib/godsway.js"
+import {
   processedTransactions,
   duplicateAttempts,
   DUPLICATE_ATTEMPT_WINDOW,
@@ -596,27 +601,8 @@ function getOrderStatusPriority(status) {
   }
 }
 
-function sanitizeGodswayProviderOrderNumber(value, appReference = "") {
-  const safeValue = String(value || "").trim()
-  const safeAppReference = String(appReference || "").trim()
-  if (!safeValue) {
-    return ""
-  }
-
-  if (safeAppReference) {
-    const lowerValue = safeValue.toLowerCase()
-    const lowerAppReference = safeAppReference.toLowerCase()
-    if (
-      lowerValue === lowerAppReference ||
-      lowerValue === `godsway-${lowerAppReference}` ||
-      lowerValue.includes(lowerAppReference)
-    ) {
-      return ""
-    }
-  }
-
-  return safeValue
-}
+// extractGodswayOrderNumber / sanitizeGodswayProviderOrderNumber now live in
+// ./lib/godsway.js (imported at the top) and are re-exported below.
 
 function resolveStoredProviderOrderNumber(provider, value, appReference = "") {
   const safeProvider = normalizeProvider(provider)
@@ -2889,17 +2875,6 @@ async function backfillPurchaseIntentsFromOrders() {
   return { created }
 }
 
-function firstNonEmptyText(values = []) {
-  for (const value of values) {
-    const safeValue = String(value || "").trim()
-    if (safeValue) {
-      return safeValue
-    }
-  }
-
-  return ""
-}
-
 function uniqueTextValues(values = []) {
   const output = []
   const seen = new Set()
@@ -3062,6 +3037,7 @@ export {
   normalizeInternalOrderStatus,
   getOrderStatusPriority,
   sanitizeGodswayProviderOrderNumber,
+  extractGodswayOrderNumber,
   resolveStoredProviderOrderNumber,
   resolveStoredProviderReference,
   parseUtcDateBoundary,
