@@ -47,15 +47,9 @@ export const metadata: Metadata = {
   category: "finance",
   alternates: { canonical: "/" },
   formatDetection: { telephone: false, email: false, address: false },
-  icons: {
-    icon: [
-      { url: "/favicon.ico", sizes: "any" },
-      { url: "/icon-192.png", type: "image/png", sizes: "192x192" },
-      { url: "/icon-512.png", type: "image/png", sizes: "512x512" },
-    ],
-    apple: [{ url: "/apple-touch-icon.png", sizes: "180x180" }],
-    shortcut: ["/favicon.ico"],
-  },
+  // Icons are supplied by the app/ file conventions (icon.svg, apple-icon.tsx),
+  // which Next links automatically. Declaring them here too would duplicate the
+  // <link> tags and let the two drift apart.
   appleWebApp: { capable: true, title: "NityHub", statusBarStyle: "default" },
   openGraph: {
     type: "website",
@@ -64,13 +58,12 @@ export const metadata: Metadata = {
     description: SITE_DESCRIPTION,
     url: "/",
     locale: "en_GH",
-    images: [{ url: "/Fullnityhub.png", width: 1536, height: 1024, alt: "NityHub" }],
+    // Preview image comes from app/opengraph-image.tsx.
   },
   twitter: {
     card: "summary_large_image",
     title: SITE_TITLE,
     description: SITE_DESCRIPTION,
-    images: ["/Fullnityhub.png"],
   },
   robots: {
     index: true,
@@ -99,7 +92,7 @@ const STRUCTURED_DATA = [
     "@type": "Organization",
     name: "NityHub",
     url: SITE_URL,
-    logo: `${SITE_URL}/icon-512.png`,
+    logo: `${SITE_URL}/pwa-icon/512`,
     description: SITE_DESCRIPTION,
   },
   {

@@ -2,6 +2,7 @@ import {
   FileText,
   LayoutDashboard,
   ClipboardList,
+  ReceiptText,
   ShoppingCart,
   User,
   Wallet,
@@ -21,6 +22,7 @@ export const NAV_ITEMS: NavItem[] = [
   { href: "/buy", label: "Buy Data", meta: "Bundles", icon: ShoppingCart },
   { href: "/orders", label: "Orders", meta: "History", icon: ClipboardList },
   { href: "/wallet", label: "Wallet", meta: "Balance", icon: Wallet },
+  { href: "/transactions", label: "Transactions", meta: "History", icon: ReceiptText },
   { href: "/account", label: "Account", meta: "Profile", icon: User },
   { href: "/afa", label: "AFA", meta: "Registration", icon: FileText },
 ];

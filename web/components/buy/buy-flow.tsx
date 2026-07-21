@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { ArrowLeft, ArrowRight, CheckCircle2, Wallet } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { formatMoney, normalizePhone } from "@/lib/format";
@@ -11,7 +11,8 @@ import { NetworkDot } from "@/components/ui/network-dot";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState, ErrorState } from "@/components/ui/states";
 import { Receipt, type ReceiptData } from "@/components/receipt/receipt";
-import type { NetworkOption } from "@/constants/networks";
+import { NetworkCard } from "@/components/buy/network-card";
+import { networkTheme, type NetworkOption } from "@/constants/networks";
 import type { DataPackage } from "@/types/models";
 
 type Step = "network" | "package" | "phone" | "confirm" | "receipt";
@@ -25,6 +26,8 @@ interface BuyFlowProps {
   open: boolean;
   onClose: () => void;
   networks: NetworkOption[];
+  /** When set, the flow opens straight at that network's packages. */
+  initialNetwork?: string;
   agentPricing: boolean;
   walletBalance: number | null;
   loadPackages: (network: string) => Promise<DataPackage[]>;
@@ -61,16 +64,17 @@ export function BuyFlow({
   open,
   onClose,
   networks,
+  initialNetwork = "",
   agentPricing,
   walletBalance,
   loadPackages,
   purchase,
   onCompleted,
 }: BuyFlowProps) {
-  const [step, setStep] = useState<Step>("network");
-  const [network, setNetwork] = useState("");
+  const [step, setStep] = useState<Step>(initialNetwork ? "package" : "network");
+  const [network, setNetwork] = useState(initialNetwork);
   const [packages, setPackages] = useState<DataPackage[]>([]);
-  const [loadingPkgs, setLoadingPkgs] = useState(false);
+  const [loadingPkgs, setLoadingPkgs] = useState(Boolean(initialNetwork));
   const [pkgError, setPkgError] = useState<string | null>(null);
   const [selected, setSelected] = useState<DataPackage | null>(null);
   const [phone, setPhone] = useState("");
@@ -79,6 +83,7 @@ export function BuyFlow({
   const [receipt, setReceipt] = useState<ReceiptData | null>(null);
 
   const networkLabel = networks.find((n) => n.value === network)?.label || network.toUpperCase();
+  const theme = networkTheme(network);
   const price = Number(selected?.price ?? selected?.userPrice ?? 0);
   const total = price; // data bundles carry no extra charge
   const normalized = normalizePhone(phone);
@@ -86,21 +91,49 @@ export function BuyFlow({
   const mismatch = detected && detected !== network;
   const insufficient = walletBalance != null && walletBalance < total;
 
-  const openPackages = async (net: string) => {
-    setNetwork(net);
-    setSelected(null);
-    setStep("package");
-    setLoadingPkgs(true);
-    setPkgError(null);
-    try {
-      setPackages(await loadPackages(net));
-    } catch (err) {
-      setPackages([]);
-      setPkgError(err instanceof Error ? err.message : "Failed to load packages.");
-    } finally {
-      setLoadingPkgs(false);
-    }
-  };
+  const openPackages = useCallback(
+    async (net: string) => {
+      setNetwork(net);
+      setSelected(null);
+      setStep("package");
+      setLoadingPkgs(true);
+      setPkgError(null);
+      try {
+        setPackages(await loadPackages(net));
+      } catch (err) {
+        setPackages([]);
+        setPkgError(err instanceof Error ? err.message : "Failed to load packages.");
+      } finally {
+        setLoadingPkgs(false);
+      }
+    },
+    [loadPackages],
+  );
+
+  // Opened from a network tile: fetch that network's bundles immediately.
+  // The parent remounts this component per open (key={flowKey}), so this runs
+  // once per flow rather than on every render. State starts already in the
+  // "package" step with loadingPkgs true, so nothing is set before the await.
+  useEffect(() => {
+    if (!initialNetwork) return;
+    let active = true;
+    (async () => {
+      try {
+        const rows = await loadPackages(initialNetwork);
+        if (active) setPackages(rows);
+      } catch (err) {
+        if (!active) return;
+        setPackages([]);
+        setPkgError(err instanceof Error ? err.message : "Failed to load packages.");
+      } finally {
+        if (active) setLoadingPkgs(false);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const goPhone = () => {
     if (normalized.length !== 10) {
@@ -223,7 +256,16 @@ export function BuyFlow({
           <ArrowLeft className="size-4" />
           Back
         </Button>
-        <Button variant="primary" size="sm" onClick={doPurchase} loading={submitting} disabled={insufficient}>
+        <Button
+          variant="primary"
+          size="sm"
+          onClick={doPurchase}
+          loading={submitting}
+          disabled={insufficient}
+          style={
+            insufficient ? undefined : { backgroundColor: theme.color, color: theme.onColor, borderColor: theme.color }
+          }
+        >
           Confirm &amp; pay {formatMoney(total)}
         </Button>
       </>
@@ -245,34 +287,48 @@ export function BuyFlow({
       size="md"
       footer={footer}
     >
-      {/* Progress bar */}
+      {/* Progress bar — tinted with the chosen network once one is picked. */}
       {step !== "receipt" ? (
         <div className="mb-4 flex gap-1.5">
           {STEP_ORDER.map((s, i) => (
             <span
               key={s}
-              className={cn(
-                "h-1 flex-1 rounded-full transition-colors",
-                i <= stepIndex ? "bg-brand" : "bg-surface-muted",
-              )}
+              className={cn("h-1 flex-1 rounded-full transition-colors", !network && "bg-surface-muted")}
+              style={
+                network
+                  ? { backgroundColor: i <= stepIndex ? theme.color : "var(--color-surface-muted)" }
+                  : undefined
+              }
             />
           ))}
         </div>
       ) : null}
 
+      {/* Network banner — keeps the active network visible on every step. */}
+      {network && step !== "network" && step !== "receipt" ? (
+        <div
+          className="mb-4 flex items-center gap-2.5 rounded-lg border px-3 py-2"
+          style={{ borderColor: theme.ring, backgroundColor: theme.tint }}
+        >
+          <span
+            className="flex size-7 shrink-0 items-center justify-center rounded-md text-[11px] font-bold"
+            style={{ backgroundColor: theme.color, color: theme.onColor }}
+            aria-hidden
+          >
+            {networkLabel.slice(0, 2).toUpperCase()}
+          </span>
+          <span className="text-sm font-semibold text-ink">{networkLabel}</span>
+          {selected ? (
+            <span className="ml-auto text-sm font-semibold tabular text-ink">{selected.label}</span>
+          ) : null}
+        </div>
+      ) : null}
+
       {/* Step: network */}
       {step === "network" ? (
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+        <div className="grid grid-cols-1 gap-2">
           {networks.map((n) => (
-            <button
-              key={n.value}
-              type="button"
-              onClick={() => openPackages(n.value)}
-              className="flex items-center gap-2 rounded-lg border border-border bg-surface p-4 text-left transition-all hover:border-brand/50 hover:bg-brand-soft/40 active:scale-[0.98]"
-            >
-              <NetworkDot network={n.value} className="size-3" />
-              <span className="font-medium text-ink">{n.label}</span>
-            </button>
+            <NetworkCard key={n.value} network={n} onSelect={openPackages} />
           ))}
         </div>
       ) : null}
@@ -280,9 +336,9 @@ export function BuyFlow({
       {/* Step: package */}
       {step === "package" ? (
         loadingPkgs ? (
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-            {Array.from({ length: 6 }).map((_, i) => (
-              <Skeleton key={i} className="h-16 rounded-lg" />
+          <div className="flex flex-col gap-2">
+            {Array.from({ length: 5 }).map((_, i) => (
+              <Skeleton key={i} className="h-14 rounded-lg" />
             ))}
           </div>
         ) : pkgError ? (
@@ -290,7 +346,8 @@ export function BuyFlow({
         ) : packages.length === 0 ? (
           <EmptyState title="No packages" description="No bundles available for this network right now." />
         ) : (
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+          /* One bundle per row: a single scannable column of size -> price. */
+          <div className="flex max-h-[22rem] flex-col gap-2 overflow-y-auto pr-0.5">
             {packages.map((p) => {
               const active = selected?.id === p.id;
               return (
@@ -302,13 +359,29 @@ export function BuyFlow({
                     setStep("phone");
                   }}
                   className={cn(
-                    "relative flex flex-col items-start gap-0.5 rounded-lg border p-3 text-left transition-all active:scale-[0.98]",
-                    active ? "border-brand bg-brand-soft ring-2 ring-brand/30" : "border-border bg-surface hover:border-border-strong",
+                    "relative flex w-full items-center gap-3 rounded-lg border p-3 text-left",
+                    "transition-all hover:-translate-y-px hover:shadow-sm active:translate-y-0 active:scale-[0.99]",
+                    !active && "border-border bg-surface hover:border-border-strong",
                   )}
+                  style={active ? { borderColor: theme.color, backgroundColor: theme.tint } : undefined}
                 >
-                  {active ? <CheckCircle2 className="absolute right-2 top-2 size-4 text-brand" /> : null}
-                  <span className="font-semibold text-ink">{p.label}</span>
-                  <span className="text-sm font-semibold tabular text-brand-strong">{formatMoney(p.price)}</span>
+                  <span
+                    className="flex size-9 shrink-0 items-center justify-center rounded-md text-[11px] font-bold"
+                    style={{ backgroundColor: theme.color, color: theme.onColor }}
+                    aria-hidden
+                  >
+                    {p.label.replace(/\s+/g, "").slice(0, 4)}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate font-semibold text-ink">{p.label}</span>
+                    <span className="block text-xs text-muted">{networkLabel} data bundle</span>
+                  </span>
+                  <span className="shrink-0 text-sm font-semibold tabular text-ink">
+                    {formatMoney(p.price)}
+                  </span>
+                  {active ? (
+                    <CheckCircle2 className="size-4 shrink-0" style={{ color: theme.color }} />
+                  ) : null}
                 </button>
               );
             })}

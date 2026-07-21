@@ -1,10 +1,10 @@
 "use client";
 
 import { Suspense, useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
-import { ArrowDownLeft, ArrowUpRight, Loader2 } from "lucide-react";
-import { cn } from "@/lib/cn";
-import { formatDate, formatMoney, shortRef } from "@/lib/format";
+import { ChevronRight, Loader2, ReceiptText } from "lucide-react";
+import { formatMoney } from "@/lib/format";
 import type { WalletData } from "@/types/models";
 import { creditDeposit, getWalletBalance, getWalletData, initiatePayment } from "@/services/api";
 import { Modal } from "@/components/ui/modal";
@@ -16,10 +16,6 @@ import { Card, CardHeader } from "@/components/ui/card";
 import { Field, Input } from "@/components/ui/field";
 import { PageHero } from "@/components/layout/page-hero";
 import { LedgerPanel } from "@/components/ui/ledger-panel";
-import { Skeleton } from "@/components/ui/skeleton";
-import { EmptyState } from "@/components/ui/states";
-import { Table, TableWrap, Td, Th } from "@/components/ui/table";
-import { useInfiniteScroll } from "@/hooks/use-infinite-scroll";
 
 const QUICK_AMOUNTS = ["10", "20", "50", "100"];
 
@@ -30,20 +26,18 @@ function WalletInner() {
   const toast = useToast();
 
   const [wallet, setWallet] = useState<WalletData | null>(null);
-  const [loading, setLoading] = useState(true);
   const [amount, setAmount] = useState("");
   const [depositing, setDepositing] = useState(false);
   const [depositReceipt, setDepositReceipt] = useState<ReceiptData | null>(null);
   const callbackHandled = useRef(false);
 
+  // The balance panel derives its own loading state from `wallet === null`,
+  // so no separate loading flag is needed here.
   const refresh = useCallback(async () => {
-    setLoading(true);
     try {
       setWallet(await getWalletData(50));
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Failed to load wallet.");
-    } finally {
-      setLoading(false);
     }
   }, [toast]);
 
@@ -138,9 +132,6 @@ function WalletInner() {
     }
   }
 
-  const transactions = wallet?.transactions ?? [];
-  const { visible, hasMore, sentinelRef } = useInfiniteScroll(transactions, 20);
-
   return (
     <>
       <PageHero title="Wallet" description="Fund your balance and review activity." />
@@ -190,64 +181,16 @@ function WalletInner() {
         </div>
       </Card>
 
-      <Card className="flex flex-col gap-4">
-        <CardHeader title="Transactions" />
-        {loading ? (
-          <div className="flex flex-col gap-2">
-            {Array.from({ length: 6 }).map((_, index) => (
-              <Skeleton key={index} className="h-11 rounded-lg" />
-            ))}
-          </div>
-        ) : transactions.length === 0 ? (
-          <EmptyState
-            title="No transactions yet"
-            description="Deposits and purchases will show up here."
-          />
-        ) : (
-          <>
-            <TableWrap>
-              <Table className="min-w-[34rem]">
-                <thead className="sticky top-0 z-10">
-                  <tr>
-                    <Th>Reference</Th>
-                    <Th>Type</Th>
-                    <Th className="text-right">Amount</Th>
-                    <Th className="text-right">Balance</Th>
-                    <Th>Date</Th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {visible.map((tx, index) => {
-                    const value = Number(tx.amount || 0);
-                    const credit = value >= 0;
-                    const reference = tx.reference || tx.details?.reference || "-";
-                    const DirIcon = credit ? ArrowDownLeft : ArrowUpRight;
-                    return (
-                      <tr key={index} className="h-11 transition-colors duration-100 hover:bg-surface-soft/60">
-                        <Td className="py-0 font-mono text-[0.8125rem] font-medium text-ink" title={reference}>
-                          {shortRef(reference, 12)}
-                        </Td>
-                        <Td className="py-0">
-                          <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
-                            <DirIcon className={cn("size-3.5", credit ? "text-success" : "text-muted")} aria-hidden />
-                            {tx.type || "transaction"}
-                          </span>
-                        </Td>
-                        <Td className={cn("py-0 text-right font-medium tabular", credit ? "text-success" : "text-ink")}>
-                          {credit ? `+${formatMoney(value)}` : `−${formatMoney(Math.abs(value))}`}
-                        </Td>
-                        <Td className="py-0 text-right tabular">{formatMoney(tx.balance || 0)}</Td>
-                        <Td className="py-0 whitespace-nowrap">{formatDate(tx.timestamp)}</Td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </Table>
-            </TableWrap>
-            {hasMore ? <div ref={sentinelRef} aria-hidden className="h-8" /> : null}
-          </>
-        )}
-      </Card>
+      <Link
+        href="/transactions"
+        className="flex items-center justify-between gap-3 rounded-card border border-border bg-surface px-4 py-3 transition-colors hover:bg-surface-soft"
+      >
+        <span className="flex items-center gap-2.5">
+          <ReceiptText className="size-4 text-muted" aria-hidden />
+          <span className="text-sm font-medium text-ink">Transaction history</span>
+        </span>
+        <ChevronRight className="size-4 text-muted" aria-hidden />
+      </Link>
 
       {/* Deposit receipt (Paystack return) */}
       <Modal

@@ -12,6 +12,7 @@ import { bootstrapAccount } from "@/services/api";
 import { Brand } from "@/components/layout/brand";
 import { Button } from "@/components/ui/button";
 import { Field, Input } from "@/components/ui/field";
+import { PasswordInput } from "@/components/ui/password-input";
 
 type Tab = "login" | "signup" | "reset";
 
@@ -152,10 +153,9 @@ export default function AuthPage() {
                 />
               </Field>
               <Field label="Password" htmlFor="login-password">
-                <Input
+                <PasswordInput
                   id="login-password"
                   name="password"
-                  type="password"
                   autoComplete="current-password"
                   placeholder="Enter your password"
                   required
@@ -201,20 +201,18 @@ export default function AuthPage() {
                 />
               </Field>
               <Field label="Password" htmlFor="signup-password">
-                <Input
+                <PasswordInput
                   id="signup-password"
                   name="password"
-                  type="password"
                   autoComplete="new-password"
                   placeholder="Create a password"
                   required
                 />
               </Field>
               <Field label="Confirm Password" htmlFor="signup-confirm">
-                <Input
+                <PasswordInput
                   id="signup-confirm"
                   name="confirmPassword"
-                  type="password"
                   autoComplete="new-password"
                   placeholder="Repeat your password"
                   required
