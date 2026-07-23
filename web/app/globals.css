@@ -71,6 +71,10 @@
 @layer base {
   html {
     -webkit-text-size-adjust: 100%;
+    /* Never let a stray wide child scroll the whole page sideways. `clip`
+       (not `hidden`) contains overflow without creating a scroll container,
+       so the sticky mobile header keeps working. */
+    overflow-x: clip;
   }
 
   body {

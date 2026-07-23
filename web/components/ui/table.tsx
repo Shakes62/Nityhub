@@ -17,7 +17,7 @@ export function TableWrap({ className, ...props }: HTMLAttributes<HTMLDivElement
 export function Table({ className, ...props }: HTMLAttributes<HTMLTableElement>) {
   return (
     <table
-      className={cn("w-full min-w-[36rem] border-collapse text-sm", className)}
+      className={cn("w-full min-w-[32rem] border-collapse text-[0.8125rem]", className)}
       {...props}
     />
   );
@@ -27,8 +27,8 @@ export function Th({ className, ...props }: ThHTMLAttributes<HTMLTableCellElemen
   return (
     <th
       className={cn(
-        "border-b border-border bg-surface-soft px-4 py-3 text-left text-[0.6875rem]",
-        "font-semibold uppercase tracking-[0.08em] text-muted",
+        "border-b border-border bg-surface-soft px-3 py-2 text-left text-[0.625rem]",
+        "font-semibold uppercase tracking-[0.07em] text-muted",
         className,
       )}
       {...props}
@@ -39,7 +39,7 @@ export function Th({ className, ...props }: ThHTMLAttributes<HTMLTableCellElemen
 export function Td({ className, ...props }: TdHTMLAttributes<HTMLTableCellElement>) {
   return (
     <td
-      className={cn("border-b border-border px-4 py-3.5 text-ink-soft", className)}
+      className={cn("border-b border-border px-3 py-2 text-ink-soft", className)}
       {...props}
     />
   );

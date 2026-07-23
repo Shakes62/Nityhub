@@ -19,8 +19,8 @@ import { getUserOrders } from "@/services/api";
 import { useAsyncData } from "@/hooks/use-async-data";
 import { useVirtualList } from "@/hooks/use-virtual-list";
 
-/** Fixed row height (px) — must match the `h-11` rows for virtualization. */
-const ROW_H = 44;
+/** Fixed row height (px) — must match the `h-9` rows for virtualization. */
+const ROW_H = 36;
 
 function reportLink(order: Order): string {
   const lines = [
@@ -101,7 +101,7 @@ export default function OrdersPage() {
             ref={scrollRef}
             className="no-scrollbar max-h-[65vh] overflow-auto rounded-lg border border-border"
           >
-            <Table className="min-w-[38rem]">
+            <Table className="min-w-[34rem]">
               <thead className="sticky top-0 z-10">
                 <tr>
                   <Th>Reference</Th>
@@ -122,7 +122,7 @@ export default function OrdersPage() {
                 {items.map((order, i) => (
                   <tr
                     key={order.reference || startIndex + i}
-                    className="h-11 transition-colors duration-100 hover:bg-surface-soft/60"
+                    className="h-9 transition-colors duration-100 hover:bg-surface-soft/60"
                   >
                     <Td
                       className="py-0 font-mono text-[0.8125rem] font-medium text-ink"

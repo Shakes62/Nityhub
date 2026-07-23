@@ -101,10 +101,10 @@ export function AppShell({ children }: { children: ReactNode }) {
         <button
           type="button"
           onClick={() => setMenuOpen(true)}
-          className="flex size-9 items-center justify-center rounded-lg border border-border text-ink-soft"
+          className="-ml-1 flex size-9 items-center justify-center text-ink transition-colors hover:text-brand"
           aria-label="Open menu"
         >
-          <Menu className="size-5" />
+          <Menu className="size-6" />
         </button>
         <span className="font-semibold text-ink">NityHub</span>
         <span className="ml-auto max-w-[45%] truncate text-sm text-muted">

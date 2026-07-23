@@ -96,7 +96,7 @@ export default function TransactionsPage() {
         ) : (
           <>
             <TableWrap>
-              <Table className="min-w-[34rem]">
+              <Table className="min-w-[32rem]">
                 <thead className="sticky top-0 z-10">
                   <tr>
                     <Th>Reference</Th>
@@ -115,7 +115,7 @@ export default function TransactionsPage() {
                     return (
                       <tr
                         key={`${reference}-${index}`}
-                        className="h-11 transition-colors duration-100 hover:bg-surface-soft/60"
+                        className="h-9 transition-colors duration-100 hover:bg-surface-soft/60"
                       >
                         <Td
                           className="py-0 font-mono text-[0.8125rem] font-medium text-ink"
