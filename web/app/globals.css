@@ -140,6 +140,49 @@
     animation: toast-in 0.2s ease-out;
   }
 
+  /* Modal / dialog surfaces. On phones the panel is a full-bleed bottom sheet
+     that slides up; from the `sm` breakpoint it becomes a centered dialog that
+     fades and rises. Overlay fades independently so the backdrop never pops. */
+  @keyframes overlay-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+  .animate-overlay-in {
+    animation: overlay-in 0.2s ease-out;
+  }
+  @keyframes sheet-in {
+    from {
+      opacity: 0;
+      transform: translateY(100%);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  @keyframes dialog-in {
+    from {
+      opacity: 0;
+      transform: translateY(10px) scale(0.98);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+  }
+  .animate-sheet-in {
+    animation: sheet-in 0.3s cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  @media (min-width: 40rem) {
+    .animate-sheet-in {
+      animation: dialog-in 0.2s ease-out;
+    }
+  }
+
   /* Selection check pop-in (package cards). */
   @keyframes pop-in {
     from {
@@ -185,11 +228,15 @@
   @media (prefers-reduced-motion: reduce) {
     .animate-shimmer::after,
     .animate-toast-in,
+    .animate-overlay-in,
+    .animate-sheet-in,
     .animate-pop,
     .stagger-children > * {
       animation: none !important;
     }
-    .animate-toast-in {
+    .animate-toast-in,
+    .animate-overlay-in,
+    .animate-sheet-in {
       opacity: 1;
     }
   }

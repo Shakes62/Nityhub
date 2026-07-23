@@ -15,12 +15,12 @@ export default function manifest(): MetadataRoute.Manifest {
     theme_color: "#00a76f",
     categories: ["finance", "utilities", "shopping"],
     icons: [
-      // Generated from the shared brand mark (see app/pwa-icon/[spec]/route.tsx)
-      // so PWA icons never drift from the favicon and apple icon.
-      { src: "/pwa-icon/192", sizes: "192x192", type: "image/png", purpose: "any" },
-      { src: "/pwa-icon/512", sizes: "512x512", type: "image/png", purpose: "any" },
-      { src: "/pwa-icon/192-maskable", sizes: "192x192", type: "image/png", purpose: "maskable" },
-      { src: "/pwa-icon/512-maskable", sizes: "512x512", type: "image/png", purpose: "maskable" },
+      // Exported from the NityHub brand mark (see public/brand/*) so PWA icons
+      // stay in sync with the favicon and apple icon.
+      { src: "/brand/icon-192.png", sizes: "192x192", type: "image/png", purpose: "any" },
+      { src: "/brand/icon-512.png", sizes: "512x512", type: "image/png", purpose: "any" },
+      { src: "/brand/icon-192-maskable.png", sizes: "192x192", type: "image/png", purpose: "maskable" },
+      { src: "/brand/icon-512-maskable.png", sizes: "512x512", type: "image/png", purpose: "maskable" },
     ],
   };
 }

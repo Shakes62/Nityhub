@@ -1,7 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="NityHub">
-  <title>NityHub</title>
-  <!-- Monochrome, transparent background. Inherits the surrounding text color
-       via currentColor, so one file serves both light and dark placements. -->
-  <path d="M20 46V18l24 28V18" fill="none" stroke="currentColor" stroke-width="7"
-        stroke-linecap="round" stroke-linejoin="round"/>
-</svg>

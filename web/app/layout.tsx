@@ -47,7 +47,7 @@ export const metadata: Metadata = {
   category: "finance",
   alternates: { canonical: "/" },
   formatDetection: { telephone: false, email: false, address: false },
-  // Icons are supplied by the app/ file conventions (icon.svg, apple-icon.tsx),
+  // Icons are supplied by the app/ file conventions (icon.png, apple-icon.png),
   // which Next links automatically. Declaring them here too would duplicate the
   // <link> tags and let the two drift apart.
   appleWebApp: { capable: true, title: "NityHub", statusBarStyle: "default" },
@@ -92,7 +92,7 @@ const STRUCTURED_DATA = [
     "@type": "Organization",
     name: "NityHub",
     url: SITE_URL,
-    logo: `${SITE_URL}/pwa-icon/512`,
+    logo: `${SITE_URL}/brand/icon-512.png`,
     description: SITE_DESCRIPTION,
   },
   {

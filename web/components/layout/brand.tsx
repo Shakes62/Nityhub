@@ -1,30 +1,32 @@
+import Image from "next/image";
 import { cn } from "@/lib/cn";
 
 /**
- * The NityHub mark: a rounded jade badge carrying the "N" monogram.
+ * The NityHub mark: the interlocking-hexagon "N" symbol on a rounded jade badge.
  *
- * Inlined rather than loaded from /brand/*.svg so it paints with the first
- * render (no extra request, no flash) and can inherit sizing from the caller.
- * The standalone files in public/brand/ are the exportable versions.
+ * The white symbol lives in /brand/nityhub-symbol-white.png (exported from the
+ * brand artwork); we tint the badge with the brand color so it matches the
+ * favicon, PWA, and social icons. Marked priority so it paints on first render.
  */
 export function BrandMark({ className }: { className?: string }) {
   return (
-    <svg
-      viewBox="0 0 64 64"
-      className={cn("size-10", className)}
+    <span
       role="img"
       aria-label="NityHub"
+      className={cn(
+        "inline-flex size-10 shrink-0 items-center justify-center rounded-[28%] bg-brand",
+        className,
+      )}
     >
-      <rect width="64" height="64" rx="14" fill="var(--color-brand)" />
-      <path
-        d="M20 46V18l24 28V18"
-        fill="none"
-        stroke="#ffffff"
-        strokeWidth="7"
-        strokeLinecap="round"
-        strokeLinejoin="round"
+      <Image
+        src="/brand/nityhub-symbol-white.png"
+        alt=""
+        width={64}
+        height={64}
+        priority
+        className="size-[62%] object-contain"
       />
-    </svg>
+    </span>
   );
 }
 

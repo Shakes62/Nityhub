@@ -1,3 +1,5 @@
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { ImageResponse } from "next/og";
 import { SITE_DESCRIPTION } from "@/constants/config";
 
@@ -5,13 +7,20 @@ export const size = { width: 1200, height: 630 };
 export const contentType = "image/png";
 export const alt = "NityHub — Data Bundles & Wallet in Ghana";
 
+/** Load the white brand symbol as a data URI so next/og can paint it. */
+async function symbolDataUri() {
+  const file = join(process.cwd(), "public", "brand", "nityhub-symbol-white.png");
+  const buf = await readFile(file);
+  return `data:image/png;base64,${buf.toString("base64")}`;
+}
+
 /**
  * Social preview card (Facebook, Twitter/X, Discord, WhatsApp, LinkedIn).
  *
- * Generated rather than shipped as a binary so it stays in sync with the brand
- * and costs no repo weight — the previous card was a 400KB PNG.
+ * Generated rather than shipped as a binary so it stays in sync with the brand.
  */
-export default function OpengraphImage() {
+export default async function OpengraphImage() {
+  const symbol = await symbolDataUri();
   return new ImageResponse(
     (
       <div
@@ -39,16 +48,8 @@ export default function OpengraphImage() {
               background: "#00a76f",
             }}
           >
-            <svg width="64" height="64" viewBox="0 0 64 64">
-              <path
-                d="M20 46V18l24 28V18"
-                fill="none"
-                stroke="#ffffff"
-                strokeWidth="7"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            </svg>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src={symbol} width={60} height={60} alt="" />
           </div>
           <div style={{ fontSize: "56px", fontWeight: 700, letterSpacing: "-1px" }}>NityHub</div>
         </div>
