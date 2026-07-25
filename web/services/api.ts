@@ -40,11 +40,14 @@ export async function updateUserProfile(input: {
   await apiRequest("/api/me/profile", { method: "PATCH", json: input, auth: true });
 }
 
+/**
+ * The signed-in user's role. Only `admin` is exposed — it gates the admin
+ * navigation. Pricing is resolved entirely server-side, so the client neither
+ * receives nor needs agent status.
+ */
 export async function getMyRole(): Promise<UserRole> {
   const res = await apiRequest<UserRole>("/api/me/role", { auth: true });
-  return (
-    res.data || { agent: false, admin: false, privileged: false, pricingTier: "user" }
-  );
+  return { admin: res.data?.admin === true };
 }
 
 /* --------------------------------- Wallet ---------------------------------- */
@@ -92,8 +95,18 @@ export async function initiatePayment(input: {
 
 /* -------------------------------- Packages --------------------------------- */
 
+/**
+ * Bundles for a network, each already carrying the single `price` that applies
+ * to this caller.
+ *
+ * `authOptional` matters: it lets the backend resolve the caller's price tier
+ * itself. The client must not compute a price — that duplication is what
+ * previously let the displayed and charged amounts diverge.
+ */
 export async function getPackages(network: string): Promise<DataPackage[]> {
-  const res = await apiRequest<DataPackage[]>(`/api/packages/${network}`);
+  const res = await apiRequest<DataPackage[]>(`/api/packages/${network}`, {
+    authOptional: true,
+  });
   return Array.isArray(res.data) ? res.data : [];
 }
 

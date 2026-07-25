@@ -1,11 +1,14 @@
 /** Domain models mirroring the shapes returned by the NityHub backend. */
 
-/** GET /api/me/role */
+/**
+ * GET /api/me/role
+ *
+ * Only `admin` is exposed, to gate the admin navigation. Agent status is
+ * intentionally NOT sent to the browser: agent pricing is applied server-side
+ * and must stay invisible to the customer.
+ */
 export interface UserRole {
-  agent: boolean;
   admin: boolean;
-  privileged: boolean;
-  pricingTier: "user" | "agent" | string;
 }
 
 /** GET /api/me/profile */
@@ -16,17 +19,22 @@ export interface UserProfile {
   createdAt?: number;
 }
 
-/** GET /api/packages/:network — a single bundle option. */
+/**
+ * GET /api/packages/:network — a single bundle option.
+ *
+ * `price` is the only price the client ever sees: the backend has already
+ * applied the caller's tier. `userPrice`/`agentPrice` are deliberately absent so
+ * the browser cannot pick a tier (it used to, and drifted from the server) and
+ * so wholesale rates are not exposed on a public endpoint.
+ */
 export interface DataPackage {
   id: string;
   label: string;
   volume?: number;
-  userPrice?: number;
-  agentPrice?: number;
   enabled?: boolean;
   sortOrder?: number;
-  /** Resolved display price after applying the user's pricing tier. */
-  price?: number;
+  /** Server-resolved price for the current caller, in GHS. */
+  price: number;
 }
 
 /** GET /api/me/wallet — a single ledger entry. */

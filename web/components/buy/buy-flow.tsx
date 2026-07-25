@@ -28,7 +28,6 @@ interface BuyFlowProps {
   networks: NetworkOption[];
   /** When set, the flow opens straight at that network's packages. */
   initialNetwork?: string;
-  agentPricing: boolean;
   walletBalance: number | null;
   loadPackages: (network: string) => Promise<DataPackage[]>;
   purchase: (input: {
@@ -65,7 +64,6 @@ export function BuyFlow({
   onClose,
   networks,
   initialNetwork = "",
-  agentPricing,
   walletBalance,
   loadPackages,
   purchase,
@@ -84,7 +82,8 @@ export function BuyFlow({
 
   const networkLabel = networks.find((n) => n.value === network)?.label || network.toUpperCase();
   const theme = networkTheme(network);
-  const price = Number(selected?.price ?? selected?.userPrice ?? 0);
+  // Already resolved for this user by the backend — never recomputed here.
+  const price = Number(selected?.price ?? 0);
   const total = price; // data bundles carry no extra charge
   const normalized = normalizePhone(phone);
   const detected = detectNetwork(phone);
@@ -469,7 +468,8 @@ export function BuyFlow({
           {insufficient ? (
             <p className="text-sm text-danger">Insufficient balance. Fund your wallet to continue.</p>
           ) : null}
-          {agentPricing ? <p className="text-xs text-muted">Agent pricing applied.</p> : null}
+          {/* No "agent pricing applied" note: the discount is applied silently
+              server-side and must not be surfaced to the customer. */}
         </div>
       ) : null}
 

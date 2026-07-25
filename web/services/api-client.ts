@@ -64,7 +64,13 @@ async function performRequest<T>(
   options: RequestOptions,
   attempt: number,
 ): Promise<ApiResponse<T>> {
-  const { json, auth: withAuth, headers: providedHeaders, ...rest } = options;
+  const {
+    json,
+    auth: withAuth,
+    authOptional: withOptionalAuth,
+    headers: providedHeaders,
+    ...rest
+  } = options;
   const method = (rest.method || "GET").toUpperCase();
 
   // Request interceptor: assemble headers consistently for every call.
@@ -80,6 +86,14 @@ async function performRequest<T>(
 
   if (withAuth) {
     headers.set("Authorization", `Bearer ${await getIdToken()}`);
+  } else if (withOptionalAuth && auth.currentUser) {
+    // Best-effort: a token failure here must not break a public endpoint, so
+    // fall through and let the server treat the call as anonymous.
+    try {
+      headers.set("Authorization", `Bearer ${await auth.currentUser.getIdToken()}`);
+    } catch {
+      /* send anonymously */
+    }
   }
 
   try {

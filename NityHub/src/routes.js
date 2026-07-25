@@ -115,6 +115,9 @@ import {
   getAdminOverviewData,
   isPrivilegedUser,
   getEffectivePackagePrice,
+  resolveUserPrice,
+  resolveAgentPrice,
+  resolveEffectivePackagePrice,
   getAfaRegistrationFee,
   sleep,
   isTransientRealtimeDisconnectError,
@@ -143,6 +146,7 @@ import {
   isWebhookIpAllowed,
   isValidWebhookToken,
   authenticateRequest,
+  optionalAuthenticateRequest,
   requirePrivilegedAccess,
   sanitizePhoneNumber,
   buildFrontendUrl,
@@ -541,7 +545,16 @@ app.get("/", (req, res) => {
   })
 })
 
-app.get("/api/packages/:network", async (req, res) => {
+/**
+ * Public package catalog.
+ *
+ * Optionally authenticated: when a valid token is supplied the caller's price
+ * tier is resolved HERE and each entry carries a single `price` field. The
+ * browser is never sent both prices, so it cannot pick the wrong one — and a
+ * non-agent has no way to be shown or charged agent pricing. The response shape
+ * is identical for every tier, which is also what keeps agent status invisible.
+ */
+app.get("/api/packages/:network", optionalAuthenticateRequest, async (req, res) => {
   const network = normalizeNetwork(req.params.network)
 
   if (!SUPPORTED_PACKAGE_NETWORKS.includes(network)) {
@@ -553,10 +566,14 @@ app.get("/api/packages/:network", async (req, res) => {
   }
 
   try {
+    const uid = String(req.authUser?.uid || "").trim()
+    // Anonymous callers and failed role lookups both fall back to regular
+    // pricing: a discount is only ever granted on an explicit true.
+    const agentPricing = uid ? await isPrivilegedUser(uid).catch(() => false) : false
     const rows = await getCatalogPackages(network)
     return res.json({
       status: "success",
-      data: rows.map((entry) => toPublicCatalogEntry(entry)),
+      data: rows.map((entry) => toPublicCatalogEntry(entry, { agentPricing })),
       timestamp: new Date().toISOString(),
     })
   } catch (error) {
@@ -2153,13 +2170,21 @@ app.patch("/api/me/profile", authenticateRequest, purchaseActionRateLimit, async
   }
 })
 
+/**
+ * The signed-in user's role, as far as the browser needs to know it.
+ *
+ * Deliberately exposes ONLY `admin`, which gates the admin navigation. Agent
+ * status is withheld: agent pricing is applied server-side and must be
+ * invisible to the customer, and the client no longer has any pricing decision
+ * to make that would need it.
+ */
 app.get("/api/me/role", authenticateRequest, async (req, res) => {
   try {
     await ensureUserAccountState(req.authUser.uid, req.authUser)
-    const data = await getUserRoleSummary(req.authUser.uid)
+    const role = await getUserRoleSummary(req.authUser.uid)
     return res.json({
       status: "success",
-      data,
+      data: { admin: role.admin === true },
       timestamp: new Date().toISOString(),
     })
   } catch (error) {

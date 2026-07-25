@@ -45,7 +45,7 @@ export function useRole(): UseRole {
       })
       .catch(() => {
         if (active) {
-          setRole({ agent: false, admin: false, privileged: false, pricingTier: "user" });
+          setRole({ admin: false });
         }
       })
       .finally(() => {

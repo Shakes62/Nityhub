@@ -4,26 +4,14 @@ import { useCallback, useEffect, useState } from "react";
 import { formatMoney } from "@/lib/format";
 import { NETWORKS } from "@/constants/networks";
 import type { DataPackage } from "@/types/models";
-import {
-  getMyRole,
-  getPackages,
-  getWalletBalance,
-  walletPurchase,
-} from "@/services/api";
+import { getPackages, getWalletBalance, walletPurchase } from "@/services/api";
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
 import { PageHero } from "@/components/layout/page-hero";
 import { BuyFlow, type PurchaseResult } from "@/components/buy/buy-flow";
 import { NetworkCard } from "@/components/buy/network-card";
 
-function resolvePrice(item: DataPackage, agentPricing: boolean): number {
-  return agentPricing
-    ? Number(item.agentPrice || item.userPrice || 0)
-    : Number(item.userPrice || 0);
-}
-
 export default function BuyPage() {
-  const [agentPricing, setAgentPricing] = useState(false);
   const [wallet, setWallet] = useState<number | null>(null);
   const [flowOpen, setFlowOpen] = useState(false);
   const [flowKey, setFlowKey] = useState(0);
@@ -37,38 +25,41 @@ export default function BuyPage() {
     }
   }, []);
 
+  // Load the opening balance. Guarded so a resolved fetch cannot set state on an
+  // unmounted page, and the write happens after the await rather than
+  // synchronously in the effect body.
   useEffect(() => {
     let active = true;
     (async () => {
-      let agent = false;
       try {
-        const role = await getMyRole();
-        agent = role.pricingTier === "agent" || role.privileged === true;
+        const balance = await getWalletBalance();
+        if (active) setWallet(balance);
       } catch {
-        /* default to regular pricing */
+        /* non-fatal for the buy screen */
       }
-      if (!active) return;
-      setAgentPricing(agent);
-      await refreshWallet();
     })();
     return () => {
       active = false;
     };
-  }, [refreshWallet]);
+  }, []);
 
+  /**
+   * No pricing decision happens here. `price` arrives already resolved for this
+   * user by the backend, which is the only place that knows their tier — so the
+   * amount shown is by construction the amount that will be debited, and agent
+   * pricing (if any) applies silently.
+   */
   const loadFlowPackages = useCallback(
     async (network: string): Promise<DataPackage[]> => {
       const rows = await getPackages(network);
       return rows
-        .filter((item) => item.enabled !== false)
-        .map((item) => ({ ...item, price: resolvePrice(item, agentPricing) }))
-        .filter((item) => Number(item.price) > 0)
+        .filter((item) => item.enabled !== false && Number(item.price) > 0)
         .sort(
           (a, b) =>
             Number(a.sortOrder || a.volume || 0) - Number(b.sortOrder || b.volume || 0),
         );
     },
-    [agentPricing],
+    [],
   );
 
   const purchase = useCallback(
@@ -98,7 +89,8 @@ export default function BuyPage() {
     <>
       <PageHero title="Buy Data" description="Pick a network, choose a bundle, and deliver instantly.">
         <div className="flex flex-wrap gap-2">
-          <Badge tone="neutral">Mode · {agentPricing ? "Agent pricing" : "Regular pricing"}</Badge>
+          {/* No pricing-tier badge: agent pricing must not be visible to the
+              customer. Prices already reflect their tier. */}
           <Badge tone="success">Wallet · {wallet === null ? "…" : formatMoney(wallet)}</Badge>
         </div>
       </PageHero>
@@ -118,7 +110,6 @@ export default function BuyPage() {
         onClose={() => setFlowOpen(false)}
         networks={NETWORKS}
         initialNetwork={initialNetwork}
-        agentPricing={agentPricing}
         walletBalance={wallet}
         loadPackages={loadFlowPackages}
         purchase={purchase}

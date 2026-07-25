@@ -39,6 +39,11 @@ import {
 } from "./lib/money.js"
 import { computeWalletMutation, WALLET_MUTATION } from "./lib/wallet-core.js"
 import {
+  resolveUserPrice,
+  resolveAgentPrice,
+  resolveEffectivePackagePrice,
+} from "./lib/pricing.js"
+import {
   extractGodswayOrderNumber,
   sanitizeGodswayProviderOrderNumber,
   firstNonEmptyText,
@@ -725,8 +730,12 @@ function normalizeCatalogEntry(raw, fallbackId = "", network = "") {
     return null
   }
 
-  const userPrice = toMoneyNumber(raw?.userPrice ?? raw?.price, 0)
-  const agentPrice = toMoneyNumber(raw?.agentPrice ?? raw?.userPrice ?? raw?.price, userPrice)
+  // resolveAgentPrice, not `agentPrice ?? userPrice`: the admin catalog editor
+  // sends Number("") || 0 for an untouched agent-price field, and `??` does not
+  // fall through on 0 — that persisted agentPrice: 0 and handed agents free
+  // data while the UI still displayed the regular price.
+  const userPrice = resolveUserPrice(raw)
+  const agentPrice = resolveAgentPrice(raw)
   const label = String(raw?.label || defaultPackageLabel(volume)).trim()
   const idBase = raw?.id || fallbackId || `${volume}-${Math.round(userPrice * 100)}`
 
@@ -753,14 +762,36 @@ function getCatalogRef(network) {
   return db.ref(`catalog/packages/${network}`)
 }
 
-function toPublicCatalogEntry(entry) {
+/**
+ * Shape a catalog entry for a customer-facing response.
+ *
+ * Returns exactly ONE price — the one that applies to this caller, resolved
+ * here on the server. Both `userPrice` and `agentPrice` are withheld, for two
+ * reasons:
+ *
+ *  1. Correctness. When the client received both it had to pick one, which
+ *     meant duplicating the tier decision in the browser. The two copies drifted
+ *     and customers were shown (and in some paths charged) the wrong tier. A
+ *     client that cannot see the wholesale price cannot apply it.
+ *  2. Confidentiality. The endpoint is public, so shipping `agentPrice` exposed
+ *     wholesale margins to anyone who called it, logged out.
+ *
+ * It also keeps agent status invisible: the response looks identical in shape
+ * for every caller, so nothing in the UI can reveal that a discount applied.
+ */
+function toPublicCatalogEntry(entry, { agentPricing = false } = {}) {
   const {
     providerMappings,
     updatedBy,
+    userPrice,
+    agentPrice,
     ...publicEntry
   } = entry || {}
 
-  return publicEntry
+  return {
+    ...publicEntry,
+    price: resolveEffectivePackagePrice(entry, { agentPricing }),
+  }
 }
 
 function getProviderRoutingRef() {
@@ -1105,11 +1136,16 @@ async function isPrivilegedUser(uid) {
   return role.privileged === true
 }
 
+/**
+ * The price to charge `uid` for `catalogEntry`.
+ *
+ * The single authority for what a customer pays. Agent pricing requires an
+ * explicit `true` from the role lookup, so an absent uid or a failed lookup
+ * falls back to the regular price rather than granting a discount.
+ */
 async function getEffectivePackagePrice(catalogEntry, uid) {
-  const canUseAgentPricing = uid ? await isPrivilegedUser(uid) : false
-  return canUseAgentPricing
-    ? toMoneyNumber(catalogEntry.agentPrice, toMoneyNumber(catalogEntry.userPrice, 0))
-    : toMoneyNumber(catalogEntry.userPrice, 0)
+  const agentPricing = uid ? await isPrivilegedUser(uid) : false
+  return resolveEffectivePackagePrice(catalogEntry, { agentPricing })
 }
 
 async function getAfaRegistrationFee() {
@@ -1737,6 +1773,34 @@ async function authenticateRequest(req, res, next) {
       timestamp: new Date().toISOString(),
     })
   }
+}
+
+/**
+ * Attach `req.authUser` when a valid token is present, otherwise continue
+ * anonymously.
+ *
+ * For endpoints that are public but whose response depends on who is asking —
+ * the package catalog, where the server has to resolve the caller's price tier
+ * rather than letting the browser choose it. A bad or expired token is treated
+ * as anonymous (regular pricing) rather than an error, so a stale tab degrades
+ * to full price instead of failing to load bundles.
+ */
+async function optionalAuthenticateRequest(req, res, next) {
+  const authHeader = String(req.headers.authorization || "")
+  if (!authHeader.startsWith("Bearer ")) {
+    return next()
+  }
+
+  try {
+    const token = authHeader.slice("Bearer ".length).trim()
+    req.authUser = await admin.auth().verifyIdToken(token)
+  } catch (error) {
+    logger.debug("Optional token verification failed; continuing anonymously", {
+      error: error?.message,
+    })
+  }
+
+  return next()
 }
 
 async function requirePrivilegedAccess(req, res, next) {
@@ -3177,6 +3241,9 @@ export {
   getAdminOverviewData,
   isPrivilegedUser,
   getEffectivePackagePrice,
+  resolveUserPrice,
+  resolveAgentPrice,
+  resolveEffectivePackagePrice,
   getAfaRegistrationFee,
   sleep,
   isTransientRealtimeDisconnectError,
@@ -3205,6 +3272,7 @@ export {
   isWebhookIpAllowed,
   isValidWebhookToken,
   authenticateRequest,
+  optionalAuthenticateRequest,
   requirePrivilegedAccess,
   sanitizePhoneNumber,
   buildFrontendUrl,

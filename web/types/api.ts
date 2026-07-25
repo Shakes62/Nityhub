@@ -38,4 +38,11 @@ export interface RequestOptions extends RequestInit {
   json?: unknown;
   /** Attach the current user's Firebase ID token as a Bearer credential. */
   auth?: boolean;
+  /**
+   * Attach the ID token when a user is signed in, but send the request
+   * anonymously rather than failing when one is not. For public endpoints whose
+   * response is personalized server-side (e.g. the package catalog, where the
+   * backend resolves the caller's price tier).
+   */
+  authOptional?: boolean;
 }
