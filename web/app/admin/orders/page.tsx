@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { Copy, Layers, RefreshCw } from "lucide-react";
+import { Copy, Layers, PencilLine, RefreshCw } from "lucide-react";
 import { Badge, statusLabel, statusTone } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardHeader } from "@/components/ui/card";
@@ -18,6 +18,7 @@ import { SortHeader } from "@/components/admin/sort-header";
 import { RowActions } from "@/components/admin/row-actions";
 import { DetailGrid, DetailRow, DetailSection } from "@/components/admin/detail";
 import { BulkStatusModal } from "@/components/admin/bulk-status-modal";
+import { OrderStatusModal } from "@/components/admin/order-status-modal";
 import { formatDate, formatMoney, shortRef } from "@/lib/format";
 import { useAdminData } from "@/contexts/admin-data-context";
 import { useToast } from "@/contexts/toast-context";
@@ -54,6 +55,7 @@ export default function AdminOrdersPage() {
   const [to, setTo] = useState("");
   const [bulkOpen, setBulkOpen] = useState(false);
   const [viewOrder, setViewOrder] = useState<AdminOrder | null>(null);
+  const [statusOrder, setStatusOrder] = useState<AdminOrder | null>(null);
 
   // Resolve a customer by uid so we show a human name, never the raw UID.
   const usersByUid = useMemo(() => {
@@ -195,6 +197,12 @@ export default function AdminOrdersPage() {
                           onView={() => setViewOrder(o)}
                           moreItems={[
                             {
+                              label: "Change status",
+                              icon: <PencilLine />,
+                              disabled: !o.reference,
+                              onClick: () => setStatusOrder(o),
+                            },
+                            {
                               label: "Copy reference",
                               icon: <Copy />,
                               disabled: !o.reference,
@@ -223,6 +231,8 @@ export default function AdminOrdersPage() {
 
       <BulkStatusModal open={bulkOpen} onClose={() => setBulkOpen(false)} onDone={reload} />
 
+      <OrderStatusModal order={statusOrder} onClose={() => setStatusOrder(null)} onDone={reload} />
+
       {/* Order detail */}
       <Modal
         open={Boolean(viewOrder)}
@@ -231,9 +241,23 @@ export default function AdminOrdersPage() {
         description={viewOrder ? nameFor(viewOrder.userId) : undefined}
         size="md"
         footer={
-          <Button variant="ghost" size="sm" onClick={() => setViewOrder(null)}>
-            Close
-          </Button>
+          <>
+            <Button variant="ghost" size="sm" onClick={() => setViewOrder(null)}>
+              Close
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={!viewOrder?.reference}
+              onClick={() => {
+                setStatusOrder(viewOrder);
+                setViewOrder(null);
+              }}
+            >
+              <PencilLine className="size-4" />
+              Change status
+            </Button>
+          </>
         }
       >
         {viewOrder ? (

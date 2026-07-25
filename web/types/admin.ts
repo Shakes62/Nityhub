@@ -124,14 +124,36 @@ export interface ProviderHealthData {
   [key: string]: unknown;
 }
 
+/** Result of a single manual order-status change. */
+export interface OrderStatusResult {
+  reference: string;
+  /** False when the order was already in the requested status (no write). */
+  changed: boolean;
+  previousStatus: string;
+  status: string;
+  provider?: string;
+  userId?: string;
+}
+
+/** One order that could not be updated during a bulk run. */
+export interface BulkStatusFailure {
+  reference: string;
+  message: string;
+}
+
 /** Result of the bulk order-status update. */
 export interface BulkStatusResult {
   matched: number;
   updated: number;
+  /** Orders that already had the target status, so nothing was written. */
+  skipped: number;
+  /** Which selector was used: an explicit reference list or a date range. */
+  mode: "references" | "date_range";
   currentStatus: string;
   nextStatus: string;
   byProvider?: Record<string, number>;
   references?: string[];
+  failures: BulkStatusFailure[];
 }
 
 /** Networks supported by the catalog/routing endpoints. */

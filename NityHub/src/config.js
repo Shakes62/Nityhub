@@ -22,13 +22,21 @@ const parseCsvUrls = (value) =>
     .map((item) => normalizeUrl(item))
     .filter(Boolean)
 
+/** Hubnet's universal (network-agnostic) transaction status lookup. */
+export const HUBNET_DEFAULT_STATUS_URL =
+  "https://console.hubnet.app/live/api/context/business/transaction/check-transaction-status"
+
 export const CONFIG = {
   port: process.env.PORT || 3000,
   frontendUrl: FRONTEND_URL,
   baseUrl: normalizeUrl(process.env.BASE_URL) || APP_URL,
   hubnetApiKey: process.env.HUBNET_API_KEY,
   hubnetWebhookUrl: process.env.HUBNET_WEBHOOK_URL || "",
-  hubnetStatusUrl: process.env.HUBNET_STATUS_URL || process.env.HUBNET_ORDER_STATUS_URL || "",
+  // Hubnet's universal, network-agnostic status lookup. Defaulting this means a
+  // missed webhook still gets reconciled by polling instead of leaving the order
+  // stuck forever; override only if Hubnet moves the endpoint.
+  hubnetStatusUrl:
+    process.env.HUBNET_STATUS_URL || process.env.HUBNET_ORDER_STATUS_URL || HUBNET_DEFAULT_STATUS_URL,
   paystackSecretKey: process.env.PAYSTACK_SECRET_KEY,
   godswayApiKey: process.env.GODSWAY_API_KEY || process.env.TELECEL_API_KEY,
   godswayBaseUrl: process.env.GODSWAY_BASE_URL || "https://console.ckgodsway.com/api",
@@ -66,6 +74,12 @@ export const CONFIG = {
   orderSyncMaxAttempts: Number(process.env.ORDER_SYNC_MAX_ATTEMPTS || 25),
   orderSyncLeaseRetryCount: Number(process.env.ORDER_SYNC_LEASE_RETRY_COUNT || 3),
   orderSyncLeaseRetryBaseMs: Number(process.env.ORDER_SYNC_LEASE_RETRY_BASE_MS || 500),
+  // Hubnet documents a hard 5 requests/minute per endpoint. Status polling has
+  // its own bucket (separate endpoint from the purchase call), so pace polls at
+  // ~12s apart and cap how many we issue per reconciliation run. Exceeding the
+  // limit returns code 1007 and would starve the reconciler.
+  hubnetStatusPollMinIntervalMs: Number(process.env.HUBNET_STATUS_POLL_MIN_INTERVAL_MS || 12000),
+  hubnetStatusPollMaxPerRun: Number(process.env.HUBNET_STATUS_POLL_MAX_PER_RUN || 4),
   purchaseIntentMaxAgeMs: Number(process.env.PURCHASE_INTENT_MAX_AGE_MS || 24 * 60 * 60 * 1000),
   idempotencyWindowMs: Number(process.env.IDEMPOTENCY_WINDOW_MS || 60 * 1000),
   providerSubmissionMaxRetries: Number(process.env.PROVIDER_SUBMISSION_MAX_RETRIES || 0),
@@ -88,7 +102,20 @@ export const DEFAULT_PROVIDER_ROUTING = {
   at: "hubnet",
   telecel: "godsway",
 }
-export const TERMINAL_ORDER_STATUSES = new Set(["delivered", "failed", "cancelled"])
+// Single definition, kept in the pure status module so it can be unit tested
+// without pulling in dotenv/Firebase. Re-exported here for existing importers.
+export { TERMINAL_ORDER_STATUSES } from "./lib/order-status.js"
+/** Statuses an administrator may assign by hand, single or in bulk. */
+export const ADMIN_ASSIGNABLE_ORDER_STATUSES = [
+  "pending",
+  "accepted",
+  "processing",
+  "delivered",
+  "failed",
+  "cancelled",
+]
+/** Upper bound on one bulk-by-reference request, to keep it responsive. */
+export const ADMIN_BULK_STATUS_MAX_REFERENCES = 500
 export const ORDER_SYNC_LEASE_PATH = "system_leases/order_status_reconciler"
 export const ORDER_SYNC_STATE_PATH = "system_sync/order_status"
 export const REFUND_QUEUE_PATH = "refund_queue"
@@ -142,4 +169,14 @@ export const DEFAULT_PACKAGE_CATALOG = {
 if (!CONFIG.paystackSecretKey) {
   console.error("Missing required environment variable: PAYSTACK_SECRET_KEY")
   process.exit(1)
+}
+
+// An unauthenticated /webhook lets anyone mark any order delivered, which
+// suppresses reconciliation and refunds. Outside development the endpoint fails
+// closed instead (see isValidWebhookToken), so warn loudly at boot.
+export const WEBHOOK_SECRET_REQUIRED = CONFIG.nodeEnv === "production"
+if (WEBHOOK_SECRET_REQUIRED && !CONFIG.providerWebhookSecret) {
+  console.error(
+    "[SECURITY] PROVIDER_WEBHOOK_SECRET is not set. Provider webhooks will be rejected until it is configured.",
+  )
 }

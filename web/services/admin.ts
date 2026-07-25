@@ -4,6 +4,7 @@ import type {
   AdminOverview,
   AdminPackage,
   BulkStatusResult,
+  OrderStatusResult,
   ProviderHealthData,
   ProviderRouting,
   ProviderRoutingData,
@@ -66,12 +67,32 @@ export async function deleteUser(userId: string): Promise<void> {
 
 /* ------------------------------- Orders ---------------------------------- */
 
-/** Bulk re-status orders in a UTC date range. Dates are `YYYY-MM-DD`. */
+/**
+ * Set one order's status by reference. Idempotent: re-sending the status the
+ * order already has succeeds with `changed: false`.
+ */
+export async function updateOrderStatus(
+  reference: string,
+  status: string,
+  note?: string,
+): Promise<OrderStatusResult> {
+  const res = await apiRequest<OrderStatusResult>(
+    `/api/admin/orders/${encodeURIComponent(reference)}/status`,
+    { method: "PATCH", json: { status, ...(note ? { note } : {}) }, auth: true },
+  );
+  return res.data as OrderStatusResult;
+}
+
+/**
+ * Bulk re-status orders, either by an explicit reference list or by a UTC date
+ * range plus a source status. Dates are `YYYY-MM-DD`.
+ */
 export async function bulkUpdateOrderStatus(input: {
-  startDate: string;
-  endDate: string;
-  currentStatus: string;
+  startDate?: string;
+  endDate?: string;
+  currentStatus?: string;
   nextStatus: string;
+  references?: string[];
 }): Promise<BulkStatusResult> {
   const res = await apiRequest<BulkStatusResult>("/api/admin/orders/bulk-status", {
     method: "PATCH",

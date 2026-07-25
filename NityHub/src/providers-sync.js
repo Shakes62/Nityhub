@@ -86,6 +86,9 @@ import {
   getGodswayStatusDetails,
   isGodswayStatusEndpointUnavailable,
   getHubnetStatusDetails,
+  getWebhookEventStatus,
+  getHubnetWebhookStatusDetails,
+  isHubnetTransactionNotFoundResponse,
   sanitizeProviderMeta,
   toMoneyNumber,
   toMoneyUnits,
@@ -360,6 +363,12 @@ async function processGodswayTransaction(payload) {
       networkKey,
       recipient,
       capacity,
+      // Godsway accepts and stores our own tracking reference. Sending it is
+      // what makes the integration idempotent and reconcilable: a retry carries
+      // the same reference instead of creating a second delivery, and
+      // GET /order-status?reference=<ours> resolves even when the purchase
+      // response never gave us a provider order number.
+      reference: String(payload.reference || "").trim(),
     }
 
     // Add webhook URL if available - send Godsway status updates to our server
@@ -695,7 +704,7 @@ function createProviderPurchaseMetadata(provider, response, reference, fallbackN
   }
 }
 
-async function getGodswayOrderStatus(reference) {
+async function getGodswayOrderStatus(reference, { appReference = "" } = {}) {
   const providerOrderNumber = String(reference || "").trim()
   if (!providerOrderNumber) {
     throw createAppError("GODSWAY_REFERENCE_MISSING", {
@@ -768,10 +777,13 @@ async function getGodswayOrderStatus(reference) {
 
   const statusDetails = getGodswayStatusDetails(data)
   const statusOrderNumber = extractGodswayOrderNumber(data)
+  // Sanitize against our own reference: now that we submit it, Godsway echoes
+  // it back, and storing it as the "provider order number" would be a lie that
+  // makes later lookups look more authoritative than they are.
   const resolvedProviderOrderNumber = resolveStoredProviderOrderNumber(
     "godsway",
     statusOrderNumber || providerOrderNumber,
-    "",
+    appReference,
   )
   return {
     supported: true,
@@ -779,7 +791,7 @@ async function getGodswayOrderStatus(reference) {
     providerReference: resolveStoredProviderReference(
       "godsway",
       statusOrderNumber || "",
-      "",
+      appReference,
       resolvedProviderOrderNumber || "",
     ),
     providerOrderNumber: resolvedProviderOrderNumber,
@@ -789,6 +801,24 @@ async function getGodswayOrderStatus(reference) {
     providerMeta: sanitizeProviderMeta("godsway", data),
     providerResponse: data,
   }
+}
+
+/**
+ * Spacing gate for Hubnet's documented 5 requests/minute-per-endpoint limit.
+ *
+ * Only the status endpoint goes through here; purchases have their own bucket
+ * and must not be delayed behind a poll. Reconciliation holds a distributed
+ * lease, so a single in-process timestamp is enough to pace the whole fleet.
+ */
+let lastHubnetStatusPollAt = 0
+
+function getHubnetStatusPollWaitMs(now = Date.now()) {
+  const minInterval = Math.max(0, Number(CONFIG.hubnetStatusPollMinIntervalMs || 0))
+  if (!minInterval || !lastHubnetStatusPollAt) {
+    return 0
+  }
+
+  return Math.max(0, lastHubnetStatusPollAt + minInterval - now)
 }
 
 async function getHubnetOrderStatus(order = {}) {
@@ -801,9 +831,22 @@ async function getHubnetOrderStatus(order = {}) {
   }
 
   const reference = String(order.reference || order.providerReference || "").trim()
+  if (!reference) {
+    return {
+      supported: false,
+      skippedReason: "Hubnet status lookup requires the order reference",
+    }
+  }
+
   const apiUrl = baseStatusUrl.includes("{reference}")
     ? baseStatusUrl.replace("{reference}", encodeURIComponent(reference))
     : `${baseStatusUrl}${baseStatusUrl.includes("?") ? "&" : "?"}reference=${encodeURIComponent(reference)}`
+
+  const waitMs = getHubnetStatusPollWaitMs()
+  if (waitMs > 0) {
+    await sleep(waitMs)
+  }
+  lastHubnetStatusPollAt = Date.now()
 
   let data
   try {
@@ -823,12 +866,29 @@ async function getHubnetOrderStatus(order = {}) {
       },
     )
   } catch (error) {
+    if (isHubnetTransactionNotFoundResponse(error?.responseData)) {
+      // Hubnet has not registered the reference yet. Skipping keeps the order
+      // open for the next sweep; treating it as a failure would wrongly mark a
+      // live order failed and trigger a refund.
+      return {
+        supported: false,
+        skippedReason: "Hubnet has no record of this reference yet",
+      }
+    }
+
     const failure = classifyHubnetFailure(error?.responseData, error?.message)
     throw createAppError(failure.code, {
       providerMessage: failure.message,
       providerResponse: error?.responseData || null,
       statusCode: error?.statusCode || null,
     })
+  }
+
+  if (isHubnetTransactionNotFoundResponse(data)) {
+    return {
+      supported: false,
+      skippedReason: "Hubnet has no record of this reference yet",
+    }
   }
 
   const statusDetails = getHubnetStatusDetails(data, normalizeInternalOrderStatus(order.status, "processing"))
@@ -913,18 +973,22 @@ const providerAdapters = {
     },
     async getOrderStatus(order) {
       assertProviderConfigured("godsway", "status")
-      // STRICTLY use godsway's own order number - DO NOT fall back to main app reference
       const rawProviderOrderNumber = String(order.providerOrderNumber || order.orderNumber || "").trim()
       const providerOrderNumber = resolveStoredProviderOrderNumber("godsway", rawProviderOrderNumber, order.reference)
-      if (!providerOrderNumber) {
+      const appReference = String(order.reference || "").trim()
+
+      // Prefer Godsway's own order number, but fall back to our reference: we
+      // now submit it on every purchase, so /order-status resolves it. Older
+      // orders placed before that change have neither and stay unpollable.
+      const lookupReference = providerOrderNumber || appReference
+      if (!lookupReference) {
         return {
           supported: false,
-          skippedReason: rawProviderOrderNumber
-            ? "Stored Godsway provider order number matched the app reference and was ignored"
-            : "Godsway provider order number not available - cannot query status with app reference",
+          skippedReason: "No Godsway order number or app reference available - cannot query status",
         }
       }
-      return await getGodswayOrderStatus(providerOrderNumber)
+
+      return await getGodswayOrderStatus(lookupReference, { appReference })
     },
     async health() {
       try {
@@ -1277,6 +1341,11 @@ async function getOpenOrderLocationsForSync(limit = CONFIG.orderSyncMaxPerRun) {
 
   const now = Date.now()
   const rows = []
+  // Hubnet caps the status endpoint at 5 requests/minute; picking more than a
+  // handful per sweep just burns the budget on 1007 rate-limit errors and
+  // starves the rest of the queue. Other providers are unconstrained.
+  const hubnetBudget = Math.max(1, Number(CONFIG.hubnetStatusPollMaxPerRun || 4))
+  let hubnetSelected = 0
   const indexRows = Object.entries(indexSnapshot.val() || {})
     .map(([reference, value]) => ({
       reference,
@@ -1301,6 +1370,12 @@ async function getOpenOrderLocationsForSync(limit = CONFIG.orderSyncMaxPerRun) {
       continue
     }
 
+    // The index carries the provider, so an over-budget Hubnet order can be
+    // skipped before paying for a read of the order node.
+    if (normalizeProvider(item.provider) === "hubnet" && hubnetSelected >= hubnetBudget) {
+      continue
+    }
+
     const orderSnapshot = await db.ref(`orders/${userId}/${orderId}`).once("value").catch(() => null)
     if (!orderSnapshot?.exists()) {
       await db.ref(`order_refs/${item.reference}`).remove().catch(() => null)
@@ -1318,6 +1393,14 @@ async function getOpenOrderLocationsForSync(limit = CONFIG.orderSyncMaxPerRun) {
         sync: order.sync,
       })
       continue
+    }
+
+    const provider = normalizeProvider(order.provider, DEFAULT_PROVIDER_ROUTING[order.network] || "hubnet")
+    if (provider === "hubnet") {
+      if (hubnetSelected >= hubnetBudget) {
+        continue
+      }
+      hubnetSelected += 1
     }
 
     rows.push({
@@ -1399,6 +1482,18 @@ async function reconcileSingleOrderStatus(orderLocation) {
         lastProviderStatusRaw: result?.providerStatusRaw || "",
       },
     })
+    // The monotonic guard may have kept the stored status (e.g. a webhook
+    // already delivered this order while the poll was in flight). Report and
+    // propagate what is actually stored, never what we asked for.
+    const appliedStatus = normalizeInternalOrderStatus(updateResult.order?.status, nextStatus)
+
+    if (updateResult.statusRejected && isTerminalOrderStatus(appliedStatus)) {
+      // Stop re-polling an order the guard has settled as terminal.
+      await updateOrderByReference(order.reference, {
+        sync: { nextAttemptAt: null, skippedReason: "" },
+      }).catch(() => null)
+    }
+
     await syncPurchaseIntentFromOrder(order.reference, updateResult.order || {
       ...order,
       provider,
@@ -1406,10 +1501,10 @@ async function reconcileSingleOrderStatus(orderLocation) {
       providerOrderNumber: nextProviderOrderNumber,
       providerStatusRaw: result?.providerStatusRaw || order.providerStatusRaw || "",
       providerStatusDescription: result?.providerStatusDescription || order.providerStatusDescription || "",
-      status: nextStatus,
+      status: appliedStatus,
     }).catch(() => null)
 
-    return { synced: true, status: nextStatus, provider }
+    return { synced: true, status: appliedStatus, provider }
   } catch (error) {
     const errorCode = getErrorCode(error)
     const message = getProviderErrorMessage(error, errorCode, "Failed to sync provider status")

@@ -50,7 +50,12 @@ export function BulkStatusModal({ open, onClose, onDone }: BulkStatusModalProps)
     try {
       const res = await bulkUpdateOrderStatus({ startDate, endDate, currentStatus, nextStatus });
       setResult(res);
-      toast.success(`Updated ${res.updated} of ${res.matched} matched orders`);
+      const failed = res.failures?.length ?? 0;
+      if (failed > 0) {
+        toast.error(`Updated ${res.updated} of ${res.matched}; ${failed} failed`);
+      } else {
+        toast.success(`Updated ${res.updated} of ${res.matched} matched orders`);
+      }
       await onDone();
     } catch (err) {
       toast.error(err instanceof ApiError || err instanceof Error ? err.message : "Bulk update failed");
@@ -105,10 +110,23 @@ export function BulkStatusModal({ open, onClose, onDone }: BulkStatusModalProps)
           <div className="rounded-lg border border-border bg-surface-soft p-4 text-sm">
             <p className="font-medium text-ink">
               {result.updated} updated · {result.matched} matched
+              {result.skipped ? ` · ${result.skipped} already set` : ""}
             </p>
             <p className="mt-1 text-muted">
               {statusLabel(result.currentStatus)} → {statusLabel(result.nextStatus)}
             </p>
+            {result.failures?.length ? (
+              <div className="mt-3 border-t border-border pt-3">
+                <p className="font-medium text-danger">{result.failures.length} failed</p>
+                <ul className="mt-1 flex flex-col gap-1 text-xs text-muted">
+                  {result.failures.slice(0, 5).map((f) => (
+                    <li key={f.reference} className="truncate">
+                      <span className="font-mono">{f.reference}</span> — {f.message}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
           </div>
         ) : null}
       </div>

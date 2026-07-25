@@ -24,7 +24,10 @@ const corsOptions = {
       callback(null, false)
     }
   },
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  // PATCH must be listed: the admin role update, the order status updates and
+  // the profile update are all PATCH routes. Omitting it here makes the browser
+  // preflight fail, so those calls never reach the server at all.
+  methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: [
     "Content-Type",
     "Authorization",
@@ -224,6 +227,15 @@ export function installBaseMiddleware(app) {
       limit: "256kb",
       strict: true,
       type: "application/json",
+      // Signature-verified webhooks need the exact bytes that were signed. This
+      // parser runs before every route, so a later express.raw() on the webhook
+      // path is a no-op (body-parser skips an already-parsed request) and the
+      // HMAC would be computed over "[object Object]". Stash the buffer here.
+      verify: (req, _res, buf) => {
+        if (buf && buf.length) {
+          req.rawBody = Buffer.from(buf)
+        }
+      },
     }),
   )
 

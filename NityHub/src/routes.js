@@ -87,6 +87,9 @@ import {
   getGodswayStatusDetails,
   isGodswayStatusEndpointUnavailable,
   getHubnetStatusDetails,
+  getWebhookEventStatus,
+  getHubnetWebhookStatusDetails,
+  isHubnetTransactionNotFoundResponse,
   sanitizeProviderMeta,
   toMoneyNumber,
   toMoneyUnits,
@@ -123,6 +126,8 @@ import {
   sanitizeUserProfileForClient,
   ensureUserAccountState,
   getUserRoleSummary,
+  listAdminUserIds,
+  setUserRoles,
   getUserAfaRegistrations,
   recordAuditEvent,
   getPurchaseIntentRef,
@@ -160,9 +165,11 @@ import {
   findOrderLocationByProviderLookup,
   findOrderLocationByLookupValue,
   createOrderRecord,
+  canApplyOrderStatus,
   updateOrderByReference,
   syncPurchaseIntentFromOrder,
   mergeOrderPayloadWithPurchaseIntent,
+  setOrderStatusManually,
   bulkUpdateOrdersStatus,
   normalizeExistingOrdersAndIndexes,
   backfillPurchaseIntentsFromOrders,
@@ -237,12 +244,25 @@ app.post("/webhook", express.json(), async (req, res) => {
       return res.status(400).json({ status: false, message: "Invalid webhook format" })
     }
 
-    const providerStatus =
+    // The `event` name is the authoritative signal on every provider that sends
+    // one — Hubnet's own `transfer.delivered` callback carries
+    // `data.status: "Processing"`, so trusting the body alone leaves delivered
+    // orders stuck on processing forever.
+    const eventStatus = getWebhookEventStatus(payload?.event)
+    const bodyStatus =
       provider === "godsway"
         ? getGodswayStatusDetails(payload)
         : provider === "gigshub"
           ? getGigshubStatusDetails(payload)
-          : getHubnetStatusDetails(payload, normalizeInternalOrderStatus(lookup.data.status, "processing"))
+          : getHubnetWebhookStatusDetails(payload, normalizeInternalOrderStatus(lookup.data.status, "processing"))
+    const providerStatus = eventStatus
+      ? {
+          providerStatusRaw: String(payload?.event || bodyStatus.providerStatusRaw || "").trim(),
+          providerStatusDescription:
+            bodyStatus.providerStatusDescription || String(payload?.message || "").trim(),
+          normalizedStatus: eventStatus,
+        }
+      : bodyStatus
     const updatedAt = Date.now()
     const providerOrderNumber = resolveStoredProviderOrderNumber(
       provider,
@@ -276,11 +296,13 @@ app.post("/webhook", express.json(), async (req, res) => {
       },
     })
     const canonicalReference = String(result.order?.reference || reference).trim()
-    if (result.found && result.order) {
-      await syncPurchaseIntentFromOrder(canonicalReference, result.order, {
-        errorMessage: "",
-      }).catch(() => null)
-    }
+    // The monotonic guard may have kept the stored status (replayed or
+    // out-of-order callback). Everything downstream must mirror what is
+    // actually stored, otherwise the purchase intent and the order disagree.
+    const appliedStatus = result.found
+      ? normalizeInternalOrderStatus(result.order?.status, providerStatus.normalizedStatus)
+      : providerStatus.normalizedStatus
+
     await upsertPurchaseIntent(canonicalReference, {
       provider,
       providerReference,
@@ -288,8 +310,8 @@ app.post("/webhook", express.json(), async (req, res) => {
       providerStatusRaw: providerStatus.providerStatusRaw,
       providerStatusDescription: providerStatus.providerStatusDescription,
       statusSource: "webhook",
-      orderStatus: providerStatus.normalizedStatus,
-      providerSubmissionStatus: isTerminalOrderStatus(providerStatus.normalizedStatus) ? "completed" : "submitted",
+      orderStatus: appliedStatus,
+      providerSubmissionStatus: isTerminalOrderStatus(appliedStatus) ? "completed" : "submitted",
       paymentStatus: "success",
       errorMessage: "",
     }).catch(() => null)
@@ -300,7 +322,7 @@ app.post("/webhook", express.json(), async (req, res) => {
       phone: lookup.phone || null,
       network: lookup.network,
       volume: lookup.volume || null,
-      status: providerStatus.normalizedStatus,
+      status: appliedStatus,
       providerStatusRaw: providerStatus.providerStatusRaw,
       providerReference,
       providerOrderNumber,
@@ -311,7 +333,10 @@ app.post("/webhook", express.json(), async (req, res) => {
 
     logger.info(`[WEBHOOK] Order ${canonicalReference} updated`, {
       provider,
-      status: providerStatus.normalizedStatus,
+      event: String(payload?.event || "").trim() || null,
+      requestedStatus: providerStatus.normalizedStatus,
+      status: appliedStatus,
+      statusApplied: result.statusApplied !== false,
       providerStatusRaw: providerStatus.providerStatusRaw,
       matchedLookupValue: matchedLookupValue || null,
       providerReference,
@@ -330,10 +355,18 @@ app.post("/webhook", express.json(), async (req, res) => {
 })
 
 // GiGSHUB webhook - HMAC-SHA256 signature verification using API key as secret
-app.post("/webhook/gigshub", express.raw({ type: "application/json" }), async (req, res) => {
+app.post("/webhook/gigshub", async (req, res) => {
   try {
-    const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(String(req.body || ""), "utf8")
+    // req.rawBody is captured by the global JSON parser's verify hook. It has
+    // to be: that parser runs first, so express.raw() here would be skipped and
+    // the HMAC would end up computed over the string "[object Object]".
+    const rawBody = Buffer.isBuffer(req.rawBody) ? req.rawBody : null
     const signature = String(req.headers["x-gigshub-signature"] || "").trim()
+
+    if (!rawBody) {
+      logger.warn("[GIGSHUB WEBHOOK] Rejected: raw body unavailable", { ip: req.ip })
+      return res.status(400).json({ status: false, message: "Invalid webhook payload" })
+    }
 
     if (!CONFIG.gigshubApiKey) {
       logger.warn("[GIGSHUB WEBHOOK] Rejected: GiGSHUB not configured")
@@ -404,7 +437,7 @@ app.post("/webhook/gigshub", express.raw({ type: "application/json" }), async (r
         lastProviderStatusRaw: rawStatus,
       }
 
-      await updateOrderByReference(reference, {
+      const updateResult = await updateOrderByReference(reference, {
         provider: "gigshub",
         providerReference: reference,
         providerOrderNumber: gigshubReference,
@@ -417,7 +450,10 @@ app.post("/webhook/gigshub", express.raw({ type: "application/json" }), async (r
         sync: syncFields,
       })
 
-      await syncPurchaseIntentFromOrder(reference, located.order, { errorMessage: "" }).catch(() => null)
+      // Mirror what was actually stored, not what we asked for: the monotonic
+      // guard drops replayed or out-of-order callbacks.
+      const appliedStatus = normalizeInternalOrderStatus(updateResult.order?.status, normalizedStatus)
+
       await upsertPurchaseIntent(reference, {
         provider: "gigshub",
         providerReference: reference,
@@ -425,8 +461,8 @@ app.post("/webhook/gigshub", express.raw({ type: "application/json" }), async (r
         providerStatusRaw: rawStatus,
         providerStatusDescription: rawStatus,
         statusSource: "webhook",
-        orderStatus: normalizedStatus,
-        providerSubmissionStatus: isTerminalOrderStatus(normalizedStatus) ? "completed" : "submitted",
+        orderStatus: appliedStatus,
+        providerSubmissionStatus: isTerminalOrderStatus(appliedStatus) ? "completed" : "submitted",
         paymentStatus: "success",
         errorMessage: "",
       }).catch(() => null)
@@ -436,7 +472,7 @@ app.post("/webhook/gigshub", express.raw({ type: "application/json" }), async (r
         provider: "gigshub",
         providerReference: reference,
         providerOrderNumber: gigshubReference,
-        status: normalizedStatus,
+        status: appliedStatus,
         providerStatusRaw: rawStatus,
         updatedFrom: "webhook",
         updatedAt,
@@ -444,7 +480,9 @@ app.post("/webhook/gigshub", express.raw({ type: "application/json" }), async (r
 
       logger.info(`[GIGSHUB WEBHOOK] Order ${reference} updated`, {
         gigshubReference,
-        status: normalizedStatus,
+        requestedStatus: normalizedStatus,
+        status: appliedStatus,
+        statusApplied: updateResult.statusApplied !== false,
         providerStatusRaw: rawStatus,
       })
 
@@ -479,6 +517,17 @@ app.get("/health", (req, res) => {
       activePhoneLocks: phoneTransactionLocks.size,
       activeUserLocks: userTransactionLocks.size,
       duplicateAttempts: duplicateAttempts.size,
+      // Surfaced so a misconfigured deployment is obvious without digging
+      // through logs: when this is false in production every inbound provider
+      // webhook is rejected and order statuses only advance via polling.
+      webhookSecretConfigured: Boolean(CONFIG.providerWebhookSecret),
+      webhookIpAllowlist: CONFIG.providerWebhookAllowedIps.length,
+    },
+    orderStatusSync: {
+      hubnetStatusUrl: resolveHubnetStatusBaseUrl() || null,
+      godswayStatusUrl: resolveGodswayStatusBaseUrl() || null,
+      hubnetWebhookConfigured: Boolean(resolveHubnetWebhookUrl()),
+      godswayWebhookConfigured: Boolean(resolveGodswayWebhookUrl()),
     },
   })
 })
@@ -848,11 +897,89 @@ app.get("/api/admin/overview", authenticateRequest, requirePrivilegedAccess, asy
   }
 })
 
+/**
+ * Manually set the status of a single order. Idempotent — re-sending the status
+ * the order already has is a success with `changed: false`.
+ */
+app.patch("/api/admin/orders/:reference/status", authenticateRequest, requirePrivilegedAccess, adminMutationRateLimit, async (req, res) => {
+  const reference = String(req.params.reference || "").trim()
+  const nextStatus = String(req.body?.status || req.body?.nextStatus || "").trim()
+  const note = String(req.body?.note || "").trim().slice(0, 300)
+
+  try {
+    const result = await setOrderStatusManually(reference, nextStatus, {
+      actorUid: req.authUser.uid,
+      note,
+    })
+
+    await recordAuditEvent({
+      actorUid: req.authUser.uid,
+      actorEmail: req.authUser.email || null,
+      action: "admin.order.status_update",
+      targetUid: result.userId || null,
+      targetRef: reference,
+      status: "success",
+      metadata: {
+        previousStatus: result.previousStatus,
+        nextStatus: result.status,
+        changed: result.changed,
+        provider: result.provider,
+        note: note || undefined,
+      },
+    }).catch(() => null)
+
+    return res.json({
+      status: "success",
+      message: result.changed
+        ? `Order ${reference} moved from ${result.previousStatus || "unknown"} to ${result.status}.`
+        : `Order ${reference} is already ${result.status}.`,
+      data: result,
+      timestamp: new Date().toISOString(),
+    })
+  } catch (error) {
+    const errorCode = getErrorCode(error)
+    const notFound = errorCode === "ADMIN_ORDER_NOT_FOUND"
+    const isClientError =
+      notFound ||
+      ["ADMIN_ORDER_REFERENCE_REQUIRED", "ADMIN_ORDER_STATUS_INVALID"].includes(errorCode)
+
+    if (!isClientError) {
+      logger.error("Failed to update order status", error, {
+        reference,
+        nextStatus,
+        adminUid: req.authUser.uid,
+      })
+    }
+
+    await recordAuditEvent({
+      actorUid: req.authUser.uid,
+      actorEmail: req.authUser.email || null,
+      action: "admin.order.status_update",
+      targetRef: reference,
+      status: "failed",
+      metadata: {
+        nextStatus,
+        error: error?.providerMessage || error?.message || "Unknown error",
+      },
+    }).catch(() => null)
+
+    return res.status(notFound ? 404 : isClientError ? 400 : 500).json({
+      status: "error",
+      errorCode: errorCode || undefined,
+      message: isClientError ? error.providerMessage : "Failed to update order status",
+      timestamp: new Date().toISOString(),
+    })
+  }
+})
+
 app.patch("/api/admin/orders/bulk-status", authenticateRequest, requirePrivilegedAccess, adminMutationRateLimit, async (req, res) => {
   const startDate = String(req.body?.startDate || "").trim()
   const endDate = String(req.body?.endDate || "").trim()
   const currentStatus = String(req.body?.currentStatus || "").trim()
   const nextStatus = String(req.body?.nextStatus || "").trim()
+  const references = Array.isArray(req.body?.references)
+    ? req.body.references.map((value) => String(value || "").trim()).filter(Boolean)
+    : []
 
   try {
     const result = await bulkUpdateOrdersStatus({
@@ -860,6 +987,7 @@ app.patch("/api/admin/orders/bulk-status", authenticateRequest, requirePrivilege
       endDate,
       currentStatus,
       nextStatus,
+      references,
       actorUid: req.authUser.uid,
     })
 
@@ -869,19 +997,23 @@ app.patch("/api/admin/orders/bulk-status", authenticateRequest, requirePrivilege
       action: "admin.order.bulk_status_update",
       status: "success",
       metadata: {
+        mode: result.mode,
         startDate,
         endDate,
         currentStatus: result.currentStatus,
         nextStatus: result.nextStatus,
         matched: result.matched,
         updated: result.updated,
+        skipped: result.skipped,
+        failed: result.failures.length,
         byProvider: result.byProvider,
       },
     }).catch(() => null)
 
+    const failureNote = result.failures.length ? ` ${result.failures.length} failed.` : ""
     return res.json({
       status: "success",
-      message: `Updated ${result.updated} orders from ${result.currentStatus} to ${result.nextStatus}.`,
+      message: `Updated ${result.updated} of ${result.matched} matched orders to ${result.nextStatus}.${failureNote}`,
       data: result,
       timestamp: new Date().toISOString(),
     })
@@ -941,45 +1073,26 @@ app.patch("/api/admin/users/:userId/role", authenticateRequest, requirePrivilege
   }
 
   try {
-    const userSnapshot = await db.ref(`users/${userId}`).once("value")
-    const existingUser = userSnapshot.exists() ? userSnapshot.val() || {} : {}
-    if (hasAdminUpdate && isAdmin !== true && userId === req.authUser.uid) {
-      const adminsSnapshot = await db.ref("users").orderByChild("isadmin").equalTo(true).once("value")
-      const otherAdminIds = adminsSnapshot.exists()
-        ? Object.keys(adminsSnapshot.val() || {}).filter((uid) => uid !== userId)
-        : []
-
-      if (!otherAdminIds.length) {
-        return res.status(400).json({
-          status: "error",
-          message: "You cannot remove admin access from the last admin account.",
-          timestamp: new Date().toISOString(),
-        })
-      }
-    }
-
-    const updates = {
-      updatedAt: Date.now(),
-      isagent: hasAgentUpdate ? isAgent : existingUser.isagent === true,
-      isadmin: hasAdminUpdate ? isAdmin : existingUser.isadmin === true,
-    }
-
-    await db.ref(`users/${userId}`).update(updates)
-    if (hasAdminUpdate) {
-      if (isAdmin) {
-        await db.ref(`admins/${userId}`).set(true).catch(() => null)
-      } else {
-        await db.ref(`admins/${userId}`).remove().catch(() => null)
-      }
-    }
+    const result = await setUserRoles(
+      userId,
+      {
+        ...(hasAgentUpdate ? { isagent: isAgent } : {}),
+        ...(hasAdminUpdate ? { isadmin: isAdmin } : {}),
+      },
+      { actorUid: req.authUser.uid },
+    )
 
     const messageParts = []
     if (hasAgentUpdate) {
-      messageParts.push(isAgent ? "User promoted to agent" : "Agent role revoked")
+      messageParts.push(result.isagent ? "User promoted to agent" : "Agent role revoked")
     }
     if (hasAdminUpdate) {
-      messageParts.push(isAdmin ? "Admin access granted" : "Admin access revoked")
+      messageParts.push(result.isadmin ? "Admin access granted" : "Admin access revoked")
     }
+    if (!result.changed) {
+      messageParts.push("(no change)")
+    }
+
     await recordAuditEvent({
       actorUid: req.authUser.uid,
       actorEmail: req.authUser.email || null,
@@ -989,6 +1102,7 @@ app.patch("/api/admin/users/:userId/role", authenticateRequest, requirePrivilege
       metadata: {
         ...(hasAgentUpdate ? { isagent: isAgent } : {}),
         ...(hasAdminUpdate ? { isadmin: isAdmin } : {}),
+        changed: result.changed,
       },
     }).catch(() => null)
 
@@ -997,13 +1111,26 @@ app.patch("/api/admin/users/:userId/role", authenticateRequest, requirePrivilege
       message: messageParts.join(". "),
       data: {
         userId,
-        isagent: updates.isagent,
-        isadmin: updates.isadmin,
+        isagent: result.isagent,
+        isadmin: result.isadmin,
+        changed: result.changed,
       },
       timestamp: new Date().toISOString(),
     })
   } catch (error) {
-    logger.error("Failed to update user role", error, { userId, adminUid: req.authUser.uid })
+    const errorCode = getErrorCode(error)
+    const clientErrorCodes = [
+      "ADMIN_ROLE_USER_REQUIRED",
+      "ADMIN_ROLE_NO_CHANGES",
+      "ADMIN_ROLE_USER_NOT_FOUND",
+      "ADMIN_ROLE_LAST_ADMIN",
+    ]
+    const isClientError = clientErrorCodes.includes(errorCode)
+
+    if (!isClientError) {
+      logger.error("Failed to update user role", error, { userId, adminUid: req.authUser.uid })
+    }
+
     await recordAuditEvent({
       actorUid: req.authUser.uid,
       actorEmail: req.authUser.email || null,
@@ -1013,12 +1140,14 @@ app.patch("/api/admin/users/:userId/role", authenticateRequest, requirePrivilege
       metadata: {
         ...(hasAgentUpdate ? { isagent: isAgent } : {}),
         ...(hasAdminUpdate ? { isadmin: isAdmin } : {}),
-        error: error?.message || "Unknown error",
+        error: error?.providerMessage || error?.message || "Unknown error",
       },
     }).catch(() => null)
-    return res.status(500).json({
+
+    return res.status(isClientError ? (errorCode === "ADMIN_ROLE_USER_NOT_FOUND" ? 404 : 400) : 500).json({
       status: "error",
-      message: "Failed to update user role",
+      errorCode: errorCode || undefined,
+      message: isClientError ? error.providerMessage : "Failed to update user role",
       timestamp: new Date().toISOString(),
     })
   }

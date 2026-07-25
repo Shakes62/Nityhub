@@ -13,6 +13,10 @@ import {
   DEFAULT_AFA_REGISTRATION_FEE,
   PURCHASE_INTENT_PATH,
   DEFAULT_PACKAGE_CATALOG,
+  ADMIN_ASSIGNABLE_ORDER_STATUSES,
+  ADMIN_BULK_STATUS_MAX_REFERENCES,
+  WEBHOOK_SECRET_REQUIRED,
+  HUBNET_DEFAULT_STATUS_URL,
 } from "./config.js"
 import { admin, db } from "./firebase.js"
 import { logger } from "./logger.js"
@@ -40,6 +44,23 @@ import {
   firstNonEmptyText,
 } from "./lib/godsway.js"
 import {
+  normalizeHubnetSuccessValue,
+  isHubnetSuccessfulResponse,
+  getHubnetResponseSummary,
+  classifyHubnetFailure,
+  getHubnetStatusDetails,
+  getHubnetWebhookStatusDetails,
+  isHubnetTransactionNotFoundResponse,
+} from "./lib/hubnet.js"
+import {
+  normalizeInternalOrderStatus,
+  isTerminalOrderStatus,
+  getOrderStatusPriority,
+  getPurchaseIntentSubmissionStatusForOrderStatus,
+  getWebhookEventStatus,
+  canApplyOrderStatus,
+} from "./lib/order-status.js"
+import {
   processedTransactions,
   duplicateAttempts,
   DUPLICATE_ATTEMPT_WINDOW,
@@ -55,114 +76,6 @@ import {
   releasePhoneTransactionLock,
   releaseUserTransactionLock,
 } from "./state.js"
-
-function normalizeHubnetSuccessValue(value) {
-  if (typeof value === "boolean") {
-    return value
-  }
-
-  const normalized = String(value || "").trim().toLowerCase()
-  if (!normalized) {
-    return null
-  }
-
-  if (["success", "successful", "true", "ok", "completed"].includes(normalized)) {
-    return true
-  }
-
-  if (["failed", "false", "error", "rejected"].includes(normalized)) {
-    return false
-  }
-
-  return null
-}
-
-function isHubnetSuccessfulResponse(data) {
-  const topLevelStatus = normalizeHubnetSuccessValue(data?.status)
-  if (topLevelStatus !== null) {
-    return topLevelStatus
-  }
-
-  const nestedStatus = normalizeHubnetSuccessValue(data?.data?.status)
-  if (nestedStatus !== null) {
-    return nestedStatus
-  }
-
-  const codes = [data?.message, data?.code, data?.data?.message, data?.data?.code]
-    .map((value) => String(value || "").trim())
-    .filter(Boolean)
-
-  return codes.includes("0000")
-}
-
-function getHubnetResponseSummary(data = {}, fallbackMessage = "") {
-  return [
-    data?.message,
-    data?.reason,
-    data?.code,
-    data?.response_code,
-    data?.data?.message,
-    data?.data?.reason,
-    data?.data?.code,
-    data?.data?.response_msg,
-    fallbackMessage,
-  ]
-    .filter(Boolean)
-    .join(" | ")
-}
-
-function classifyHubnetFailure(data = {}, fallbackMessage = "") {
-  const summary = getHubnetResponseSummary(data, fallbackMessage)
-  const normalized = summary.toLowerCase()
-
-  if (
-    normalized.includes("invalid token") ||
-    normalized.includes("no token") ||
-    normalized.includes("unauthorized")
-  ) {
-    return {
-      code: "HUBNET_AUTH_FAILED",
-      message: "Hubnet API authentication failed. Update HUBNET_API_KEY.",
-    }
-  }
-
-  if (normalized.includes("insufficient")) {
-    return {
-      code: "INSUFFICIENT_HUBNET_BALANCE",
-      message: "Service provider has insufficient balance",
-    }
-  }
-
-  if (
-    normalized.includes("rate limit") ||
-    normalized.includes("too many request") ||
-    normalized.includes("429")
-  ) {
-    return {
-      code: "HUBNET_RATE_LIMITED",
-      message: "Hubnet API rate limit reached. Please try again shortly.",
-    }
-  }
-
-  if (normalized.includes("invalid network") || normalized.includes("1001")) {
-    return {
-      code: "HUBNET_INVALID_NETWORK",
-      message: "Hubnet rejected the selected network",
-    }
-  }
-
-  if (normalized.includes("invalid volume") || normalized.includes("1002")) {
-    return {
-      code: "HUBNET_INVALID_VOLUME",
-      message: "Hubnet rejected the selected bundle size",
-    }
-  }
-
-  return {
-    code: "HUBNET_API_ERROR",
-    message: summary || "Hubnet transaction failed",
-  }
-}
 
 function resolveHubnetWebhookUrl() {
   const configuredWebhookUrl = String(CONFIG.hubnetWebhookUrl || "").trim()
@@ -231,8 +144,18 @@ function isKnownAppOriginUrl(value) {
 
 function resolveHubnetStatusBaseUrl() {
   const configuredStatusUrl = normalizeUrl(CONFIG.hubnetStatusUrl)
+
+  // A status URL pointing back at our own origin is a misconfiguration (it has
+  // been set to APP_URL in the past). Previously that silently disabled status
+  // polling entirely, so a missed webhook left the order open forever. Fall
+  // back to Hubnet's documented endpoint instead of giving up.
   if (!configuredStatusUrl || isKnownAppOriginUrl(configuredStatusUrl)) {
-    return ""
+    if (configuredStatusUrl) {
+      logger.warn("HUBNET_STATUS_URL points at this app; using Hubnet's default status endpoint instead", {
+        configuredStatusUrl,
+      })
+    }
+    return HUBNET_DEFAULT_STATUS_URL
   }
 
   return configuredStatusUrl
@@ -515,92 +438,6 @@ function getPackageProviderMapping(network, provider, catalogEntry) {
   return mapping
 }
 
-function isTerminalOrderStatus(status) {
-  return TERMINAL_ORDER_STATUSES.has(normalizeInternalOrderStatus(status, ""))
-}
-
-function normalizeInternalOrderStatus(value, fallback = "pending") {
-  const normalized = String(value || "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, "_")
-
-  if (!normalized) {
-    return fallback
-  }
-
-  if (["initiated", "accepted", "queued"].includes(normalized)) {
-    return "accepted"
-  }
-
-  if (["pending", "awaiting", "submitted"].includes(normalized)) {
-    return "pending"
-  }
-
-  if (["processing", "in_progress", "running"].includes(normalized)) {
-    return "processing"
-  }
-
-  if (["successful", "success", "completed", "complete", "delivered"].includes(normalized)) {
-    return "delivered"
-  }
-
-  if (["failed", "error", "rejected"].includes(normalized)) {
-    return "failed"
-  }
-
-  if (["cancelled", "canceled"].includes(normalized)) {
-    return "cancelled"
-  }
-
-  if (["unsuccessful", "unsuccess", "declined"].some((term) => normalized.includes(term))) {
-    return "failed"
-  }
-
-  if (["failed", "error", "reject", "declin"].some((term) => normalized.includes(term))) {
-    return "failed"
-  }
-
-  if (normalized.includes("cancel")) {
-    return "cancelled"
-  }
-
-  if (["process", "progress", "running"].some((term) => normalized.includes(term))) {
-    return "processing"
-  }
-
-  if (["pending", "await", "submit"].some((term) => normalized.includes(term))) {
-    return "pending"
-  }
-
-  if (["success", "deliver", "complet", "fulfil", "fulfilled"].some((term) => normalized.includes(term))) {
-    return "delivered"
-  }
-
-  if (["initiat", "queue", "accept"].some((term) => normalized.includes(term))) {
-    return "accepted"
-  }
-
-  return fallback
-}
-
-function getOrderStatusPriority(status) {
-  switch (normalizeInternalOrderStatus(status, "")) {
-    case "accepted":
-      return 1
-    case "pending":
-      return 2
-    case "processing":
-      return 3
-    case "delivered":
-    case "failed":
-    case "cancelled":
-      return 4
-    default:
-      return 0
-  }
-}
-
 // extractGodswayOrderNumber / sanitizeGodswayProviderOrderNumber now live in
 // ./lib/godsway.js (imported at the top) and are re-exported below.
 
@@ -653,23 +490,6 @@ function parseUtcDateBoundary(value, boundary = "start") {
   return boundary === "end"
     ? Date.UTC(year, monthIndex, day, 23, 59, 59, 999)
     : Date.UTC(year, monthIndex, day, 0, 0, 0, 0)
-}
-
-function getPurchaseIntentSubmissionStatusForOrderStatus(status) {
-  const normalized = normalizeInternalOrderStatus(status, "pending")
-  if (normalized === "delivered") {
-    return "completed"
-  }
-
-  if (["failed", "cancelled"].includes(normalized)) {
-    return "failed"
-  }
-
-  if (["accepted", "pending", "processing"].includes(normalized)) {
-    return "submitted"
-  }
-
-  return "pending"
 }
 
 function getProviderLegacyResponseField(provider) {
@@ -856,34 +676,6 @@ function isGodswayStatusEndpointUnavailable(error = {}) {
   }
 
   return responseMessage.includes("page not found") || responseMessage.includes("404")
-}
-
-function getHubnetStatusDetails(data = {}, fallbackStatus = "accepted") {
-  const rawStatusCandidate = firstNonEmptyText([
-    data?.data?.status,
-    data?.status,
-    data?.data?.response_msg,
-    data?.reason,
-    data?.data?.message,
-    data?.message,
-  ])
-  const successState = isHubnetSuccessfulResponse(data)
-  const providerStatusDescription = getHubnetResponseSummary(data)
-  const rawStatus =
-    (["true", "false"].includes(String(rawStatusCandidate).toLowerCase()) ? "" : rawStatusCandidate) ||
-    (successState === true ? "SUCCESS" : successState === false ? "FAILED" : fallbackStatus)
-  const normalizedFallback =
-    successState === true
-      ? "delivered"
-      : successState === false
-        ? "failed"
-        : normalizeInternalOrderStatus(providerStatusDescription, fallbackStatus)
-
-  return {
-    providerStatusRaw: rawStatus,
-    providerStatusDescription,
-    normalizedStatus: normalizeInternalOrderStatus(rawStatus, normalizedFallback),
-  }
 }
 
 function sanitizeProviderMeta(provider, value = {}) {
@@ -1424,10 +1216,28 @@ async function ensureUserAccountState(uid, authUser = {}, overrides = {}) {
     !hasExplicitAdminFlag
 
   if (shouldWriteUser) {
-    await userRef.set({
-      ...nextUserFields,
+    // update(), not set(). This runs on almost every authenticated request, so
+    // a whole-node overwrite would (a) delete any field this function does not
+    // know about and (b) race an admin's role change — the stale isagent/isadmin
+    // read at the top of this function would be written straight back over it.
+    // Role flags are only ever written here to initialise them when absent.
+    const profileUpdates = {
+      username: nextUserFields.username,
+      email: nextUserFields.email,
+      phone: nextUserFields.phone,
+      createdAt: nextUserFields.createdAt,
       updatedAt: now,
-    })
+    }
+
+    if (!hasExplicitAgentFlag) {
+      profileUpdates.isagent = false
+    }
+
+    if (!hasExplicitAdminFlag) {
+      profileUpdates.isadmin = false
+    }
+
+    await userRef.update(profileUpdates)
   }
 
   if (!walletSnap.exists()) {
@@ -1477,6 +1287,108 @@ async function getUserRoleSummary(uid) {
     privileged: isAgent || isAdmin,
     pricingTier: isAgent || isAdmin ? "agent" : "user",
   }
+}
+
+/**
+ * All uids currently flagged `isadmin`.
+ *
+ * Uses the indexed query when the database has an `.indexOn` rule for isadmin
+ * and falls back to a full scan otherwise, so a missing index degrades to
+ * "slower" rather than "the last-admin guard silently stops working".
+ */
+async function listAdminUserIds() {
+  try {
+    const snapshot = await db.ref("users").orderByChild("isadmin").equalTo(true).once("value")
+    if (snapshot.exists()) {
+      return Object.keys(snapshot.val() || {})
+    }
+    return []
+  } catch (error) {
+    logger.warn("Indexed admin lookup failed; falling back to a full scan", {
+      error: error?.message || String(error),
+    })
+    const snapshot = await db.ref("users").once("value")
+    if (!snapshot.exists()) {
+      return []
+    }
+    return Object.entries(snapshot.val() || {})
+      .filter(([, value]) => value?.isadmin === true)
+      .map(([uid]) => uid)
+  }
+}
+
+/**
+ * Grant or revoke the agent/admin flags for one user.
+ *
+ * Writes `users/<uid>` and the `admins/<uid>` mirror in a single multi-path
+ * update so the two can never disagree, and refuses any change that would leave
+ * the platform with zero admins (locking everyone out of the admin panel with
+ * no way back in). Idempotent: asking for the flags a user already has reports
+ * `changed: false` and writes nothing.
+ */
+async function setUserRoles(userId, { isagent, isadmin } = {}, { actorUid = "" } = {}) {
+  const safeUserId = String(userId || "").trim()
+  if (!safeUserId) {
+    throw createAppError("ADMIN_ROLE_USER_REQUIRED", {
+      providerMessage: "A valid userId is required.",
+    })
+  }
+
+  const hasAgentUpdate = isagent !== undefined
+  const hasAdminUpdate = isadmin !== undefined
+  if (!hasAgentUpdate && !hasAdminUpdate) {
+    throw createAppError("ADMIN_ROLE_NO_CHANGES", {
+      providerMessage: "At least one role flag is required.",
+    })
+  }
+
+  const userSnapshot = await db.ref(`users/${safeUserId}`).once("value")
+  if (!userSnapshot.exists()) {
+    throw createAppError("ADMIN_ROLE_USER_NOT_FOUND", {
+      providerMessage: "That user account no longer exists.",
+    })
+  }
+
+  const existingUser = userSnapshot.val() || {}
+  const previous = {
+    isagent: existingUser.isagent === true,
+    isadmin: existingUser.isadmin === true,
+  }
+  const next = {
+    isagent: hasAgentUpdate ? isagent === true : previous.isagent,
+    isadmin: hasAdminUpdate ? isadmin === true : previous.isadmin,
+  }
+
+  // Demoting an admin: make sure somebody else still holds the keys. This
+  // applies to any target, not just self-demotion — revoking the last admin
+  // from another account locks the platform just as hard.
+  if (previous.isadmin && !next.isadmin) {
+    const adminIds = await listAdminUserIds()
+    const remaining = adminIds.filter((uid) => uid !== safeUserId)
+    if (!remaining.length) {
+      throw createAppError("ADMIN_ROLE_LAST_ADMIN", {
+        providerMessage: "You cannot remove admin access from the last admin account.",
+      })
+    }
+  }
+
+  if (previous.isagent === next.isagent && previous.isadmin === next.isadmin) {
+    return { userId: safeUserId, changed: false, ...next }
+  }
+
+  // One multi-path update: users/<uid> and the admins/<uid> mirror commit
+  // together or not at all.
+  const updates = {
+    [`users/${safeUserId}/isagent`]: next.isagent,
+    [`users/${safeUserId}/isadmin`]: next.isadmin,
+    [`users/${safeUserId}/updatedAt`]: Date.now(),
+    [`admins/${safeUserId}`]: next.isadmin ? true : null,
+  }
+
+  await db.ref().update(updates)
+  logger.info("User roles updated", { userId: safeUserId, actorUid, previous, next })
+
+  return { userId: safeUserId, changed: true, previous, ...next }
 }
 
 async function getUserAfaRegistrations(uid, { limit = 30 } = {}) {
@@ -1783,6 +1695,13 @@ function isWebhookIpAllowed(ip) {
 function isValidWebhookToken(token) {
   const expected = String(CONFIG.providerWebhookSecret || "").trim()
   if (!expected) {
+    // Fail closed in production: an unauthenticated /webhook lets anyone mark
+    // any order delivered, which suppresses reconciliation and blocks refunds.
+    // Development keeps working without a secret so local testing is painless.
+    if (WEBHOOK_SECRET_REQUIRED) {
+      logger.error("Provider webhook rejected: PROVIDER_WEBHOOK_SECRET is not configured")
+      return false
+    }
     return true
   }
 
@@ -2508,22 +2427,83 @@ async function createOrderRecord(uid, payload) {
   return { id: orderRef.key, ...record }
 }
 
-async function updateOrderByReference(reference, updates = {}) {
+/**
+ * Merge `updates` into the stored order inside a Realtime Database transaction.
+ *
+ * Everything that mutates an order (webhooks, the reconciler, retries, admin
+ * actions) funnels through here, so concurrent writers cannot lose each other's
+ * fields the way a read-then-set would. The status field is additionally gated
+ * by canApplyOrderStatus, which makes replayed webhooks a no-op (idempotent) and
+ * rejects regressions.
+ */
+async function updateOrderByReference(reference, updates = {}, { manual = false } = {}) {
   const located = await findOrderLocationByReference(reference, { includeOrder: true })
   if (!located) {
     return { found: false, order: null }
   }
 
-  const nextOrder = normalizeStoredOrderRecord({
-    ...located.order,
-    ...updates,
-    sync: {
-      ...(located.order?.sync || {}),
-      ...(updates?.sync || {}),
-    },
+  const orderRef = db.ref(`orders/${located.userId}/${located.orderId}`)
+  const hasStatusUpdate = Object.prototype.hasOwnProperty.call(updates || {}, "status")
+  let statusApplied = !hasStatusUpdate
+  let statusRejected = false
+  let nextOrder = null
+
+  const result = await orderRef.transaction((current) => {
+    // Never return undefined here. The Realtime Database may invoke this
+    // handler optimistically with a cold-cache `null` before it has the server
+    // value; returning undefined would abort the whole transaction on that
+    // first pass and the update would be silently dropped. Returning a value
+    // always lets the SDK re-run the handler against real server data when the
+    // optimistic guess turns out to be stale.
+    //
+    // The base is `located.order`, read moments ago, so a null here just means
+    // "not cached yet" rather than "deleted" in every realistic case.
+    const base = current === null ? located.order || {} : current
+    const candidate = { ...(updates || {}) }
+    const currentStatus = normalizeInternalOrderStatus(base?.status, "")
+
+    if (hasStatusUpdate) {
+      const allowed = canApplyOrderStatus(currentStatus, candidate.status, { manual })
+      statusApplied = allowed
+      statusRejected =
+        !allowed && normalizeInternalOrderStatus(candidate.status, "") !== currentStatus
+
+      if (!allowed) {
+        // Keep the provider bookkeeping (references, sync metadata, raw status
+        // text) but do not touch the authoritative status or its timestamps.
+        delete candidate.status
+        delete candidate.statusSource
+        delete candidate.statusUpdatedAt
+      }
+    }
+
+    nextOrder = normalizeStoredOrderRecord({
+      ...base,
+      ...candidate,
+      sync: {
+        ...(base?.sync || {}),
+        ...(candidate?.sync || {}),
+      },
+    })
+
+    return nextOrder
   })
 
-  await db.ref(`orders/${located.userId}/${located.orderId}`).set(nextOrder)
+  if (!result.committed || !result.snapshot.exists()) {
+    return { found: false, order: null, statusApplied: false, statusRejected }
+  }
+
+  nextOrder = result.snapshot.val() || nextOrder
+
+  if (statusRejected) {
+    logger.info("Order status update rejected by monotonic guard", {
+      reference,
+      requestedStatus: normalizeInternalOrderStatus(updates?.status, ""),
+      currentStatus: normalizeInternalOrderStatus(nextOrder?.status, ""),
+      statusSource: updates?.statusSource || "",
+    })
+  }
+
   const previousReference = String(located.order?.reference || "").trim()
   const nextReference = String(nextOrder.reference || reference).trim()
   if (previousReference && previousReference !== nextReference) {
@@ -2547,6 +2527,8 @@ async function updateOrderByReference(reference, updates = {}) {
     userId: located.userId,
     orderId: located.orderId,
     order: nextOrder,
+    statusApplied,
+    statusRejected,
   }
 }
 
@@ -2648,17 +2630,185 @@ function mergeOrderPayloadWithPurchaseIntent(basePayload = {}, intent = null) {
   return nextPayload
 }
 
+/**
+ * Force an order to a status on an administrator's behalf.
+ *
+ * Goes through the same atomic updateOrderByReference path as every other
+ * writer, but with `manual: true` so the monotonic guard steps aside — support
+ * has to be able to correct a wrong terminal state. Idempotent: re-applying the
+ * status the order already has is reported as `changed: false` and writes
+ * nothing.
+ */
+async function setOrderStatusManually(reference, nextStatus, { actorUid = "", statusSource = "admin_manual_update", note = "" } = {}) {
+  const safeReference = String(reference || "").trim()
+  const normalizedNextStatus = normalizeInternalOrderStatus(nextStatus, "")
+
+  if (!safeReference) {
+    throw createAppError("ADMIN_ORDER_REFERENCE_REQUIRED", {
+      providerMessage: "An order reference is required.",
+    })
+  }
+
+  if (!normalizedNextStatus || !ADMIN_ASSIGNABLE_ORDER_STATUSES.includes(normalizedNextStatus)) {
+    throw createAppError("ADMIN_ORDER_STATUS_INVALID", {
+      providerMessage: `Status must be one of: ${ADMIN_ASSIGNABLE_ORDER_STATUSES.join(", ")}.`,
+    })
+  }
+
+  const located = await findOrderLocationByReference(safeReference, { includeOrder: true })
+  if (!located) {
+    throw createAppError("ADMIN_ORDER_NOT_FOUND", {
+      providerMessage: `No order found for reference ${safeReference}.`,
+    })
+  }
+
+  const currentOrder = normalizeStoredOrderRecord(located.order || {})
+  const previousStatus = normalizeInternalOrderStatus(currentOrder.status, "")
+  if (previousStatus === normalizedNextStatus) {
+    return {
+      reference: safeReference,
+      changed: false,
+      previousStatus,
+      status: previousStatus,
+      provider: currentOrder.provider || "",
+      userId: located.userId,
+    }
+  }
+
+  const now = Date.now()
+  const safeNote = String(note || "").trim()
+  const result = await updateOrderByReference(
+    safeReference,
+    {
+      status: normalizedNextStatus,
+      statusSource,
+      statusUpdatedAt: now,
+      updatedAt: now,
+      providerStatusDescription:
+        safeNote || `Status set to ${normalizedNextStatus} by an administrator`,
+      sync: {
+        manualOverrideAt: now,
+        manualOverrideBy: String(actorUid || "").trim(),
+        // A manually-terminal order must never be picked up by the reconciler
+        // again, or the provider would immediately overwrite the correction.
+        nextAttemptAt: isTerminalOrderStatus(normalizedNextStatus)
+          ? null
+          : currentOrder?.sync?.nextAttemptAt || null,
+        skippedReason: "",
+        lastError: "",
+      },
+    },
+    { manual: true },
+  )
+
+  if (!result.found) {
+    throw createAppError("ADMIN_ORDER_NOT_FOUND", {
+      providerMessage: `No order found for reference ${safeReference}.`,
+    })
+  }
+
+  await syncPurchaseIntentFromOrder(safeReference, result.order, {
+    statusSource,
+    errorMessage: ["failed", "cancelled"].includes(normalizedNextStatus)
+      ? safeNote || `Administrator set status to ${normalizedNextStatus}`
+      : "",
+  }).catch(() => null)
+
+  return {
+    reference: safeReference,
+    changed: true,
+    previousStatus,
+    status: normalizeInternalOrderStatus(result.order?.status, normalizedNextStatus),
+    provider: normalizeProvider(result.order?.provider, "") || currentOrder.provider || "",
+    userId: located.userId,
+  }
+}
+
+/**
+ * Re-status many orders at once, selected either by an explicit reference list
+ * or by a UTC date range plus a source status.
+ *
+ * Each order is written through setOrderStatusManually, so a partial failure
+ * leaves the already-processed orders correctly updated and reports the rest in
+ * `failures` rather than rolling the whole batch back into an unknown state.
+ */
 async function bulkUpdateOrdersStatus({
   startDate,
   endDate,
   currentStatus,
   nextStatus,
+  references = [],
   actorUid = "",
 } = {}) {
+  const normalizedNextStatus = normalizeInternalOrderStatus(nextStatus, "")
+  const requestedReferences = uniqueTextValues(Array.isArray(references) ? references : [])
+  const byReference = requestedReferences.length > 0
+
+  if (!normalizedNextStatus || !ADMIN_ASSIGNABLE_ORDER_STATUSES.includes(normalizedNextStatus)) {
+    throw createAppError("ADMIN_ORDER_BULK_STATUS_INVALID", {
+      providerMessage: `Next status must be one of: ${ADMIN_ASSIGNABLE_ORDER_STATUSES.join(", ")}.`,
+    })
+  }
+
+  if (byReference && requestedReferences.length > ADMIN_BULK_STATUS_MAX_REFERENCES) {
+    throw createAppError("ADMIN_ORDER_BULK_TOO_MANY_REFERENCES", {
+      providerMessage: `At most ${ADMIN_BULK_STATUS_MAX_REFERENCES} references can be updated in one request.`,
+    })
+  }
+
+  const outcome = {
+    matched: 0,
+    updated: 0,
+    skipped: 0,
+    startAt: null,
+    endAt: null,
+    mode: byReference ? "references" : "date_range",
+    currentStatus: normalizeInternalOrderStatus(currentStatus, ""),
+    nextStatus: normalizedNextStatus,
+    byProvider: {},
+    references: [],
+    failures: [],
+  }
+
+  const applyTo = async (reference) => {
+    outcome.matched += 1
+    try {
+      const result = await setOrderStatusManually(reference, normalizedNextStatus, {
+        actorUid,
+        statusSource: "admin_bulk_update",
+      })
+
+      if (!result.changed) {
+        outcome.skipped += 1
+        return
+      }
+
+      const provider = normalizeProvider(result.provider, "unknown") || "unknown"
+      outcome.byProvider[provider] = (outcome.byProvider[provider] || 0) + 1
+      outcome.updated += 1
+      if (outcome.references.length < 50) {
+        outcome.references.push(reference)
+      }
+    } catch (error) {
+      outcome.failures.push({
+        reference,
+        message: error?.providerMessage || error?.message || "Update failed",
+      })
+      logger.error("Bulk order status update failed for one order", error, { reference, actorUid })
+    }
+  }
+
+  if (byReference) {
+    for (const reference of requestedReferences) {
+      await applyTo(reference)
+    }
+
+    return outcome
+  }
+
   const startAt = parseUtcDateBoundary(startDate, "start")
   const endAt = parseUtcDateBoundary(endDate, "end")
-  const normalizedCurrentStatus = normalizeInternalOrderStatus(currentStatus, "")
-  const normalizedNextStatus = normalizeInternalOrderStatus(nextStatus, "")
+  const normalizedCurrentStatus = outcome.currentStatus
 
   if (!startAt || !endAt) {
     throw createAppError("ADMIN_ORDER_BULK_DATE_INVALID", {
@@ -2672,7 +2822,7 @@ async function bulkUpdateOrdersStatus({
     })
   }
 
-  if (!normalizedCurrentStatus || !normalizedNextStatus) {
+  if (!normalizedCurrentStatus) {
     throw createAppError("ADMIN_ORDER_BULK_STATUS_INVALID", {
       providerMessage: "Current status and next status are required.",
     })
@@ -2684,99 +2834,47 @@ async function bulkUpdateOrdersStatus({
     })
   }
 
+  outcome.startAt = startAt
+  outcome.endAt = endAt
+
   const ordersSnapshot = await db.ref("orders").once("value")
   if (!ordersSnapshot.exists()) {
-    return {
-      matched: 0,
-      updated: 0,
-      startAt,
-      endAt,
-      currentStatus: normalizedCurrentStatus,
-      nextStatus: normalizedNextStatus,
-      byProvider: {},
-      references: [],
-    }
+    return outcome
   }
 
+  // Collect the matching references first, then mutate. Iterating the snapshot
+  // while writing would mean deciding from a view of the data that is already
+  // going stale.
   const ordersData = ordersSnapshot.val() || {}
-  const now = Date.now()
-  const byProvider = {}
-  const references = []
-  let matched = 0
-  let updated = 0
-
+  const targets = []
   for (const userId of Object.keys(ordersData)) {
     const userOrders = ordersData[userId] || {}
     for (const orderId of Object.keys(userOrders)) {
       const currentOrder = normalizeStoredOrderRecord(userOrders[orderId] || {})
       const orderTimestamp =
         toTimestampValue(currentOrder.timestamp || currentOrder.createdAt || currentOrder.updatedAt, 0) || 0
-      const orderStatus = normalizeInternalOrderStatus(currentOrder.status, "")
 
       if (!orderTimestamp || orderTimestamp < startAt || orderTimestamp > endAt) {
         continue
       }
 
-      if (orderStatus !== normalizedCurrentStatus) {
+      if (normalizeInternalOrderStatus(currentOrder.status, "") !== normalizedCurrentStatus) {
         continue
       }
 
-      matched += 1
-
-      const nextOrder = normalizeStoredOrderRecord({
-        ...currentOrder,
-        status: normalizedNextStatus,
-        statusSource: "admin_bulk_update",
-        statusUpdatedAt: now,
-        updatedAt: now,
-        sync: {
-          ...(currentOrder.sync || {}),
-          manualOverrideAt: now,
-          manualOverrideBy: String(actorUid || "").trim(),
-          nextAttemptAt: isTerminalOrderStatus(normalizedNextStatus)
-            ? null
-            : currentOrder?.sync?.nextAttemptAt || null,
-          skippedReason: "",
-        },
-      })
-
-      await db.ref(`orders/${userId}/${orderId}`).set(nextOrder)
-      if (nextOrder.reference) {
-        await setOrderReferenceIndex(nextOrder.reference, {
-          userId,
-          orderId,
-          provider: nextOrder.provider,
-          network: nextOrder.network,
-          status: nextOrder.status,
-          sync: nextOrder.sync,
-        })
-        await syncProviderOrderLookupIndexes(currentOrder, nextOrder, { userId, orderId })
-        await syncPurchaseIntentFromOrder(nextOrder.reference, nextOrder, {
-          errorMessage: ["failed", "cancelled"].includes(normalizedNextStatus)
-            ? `Admin bulk update set status to ${normalizedNextStatus}`
-            : "",
-        }).catch(() => null)
-        if (references.length < 50) {
-          references.push(nextOrder.reference)
-        }
+      if (!currentOrder.reference) {
+        continue
       }
 
-      const provider = normalizeProvider(nextOrder.provider, "unknown") || "unknown"
-      byProvider[provider] = (byProvider[provider] || 0) + 1
-      updated += 1
+      targets.push(currentOrder.reference)
     }
   }
 
-  return {
-    matched,
-    updated,
-    startAt,
-    endAt,
-    currentStatus: normalizedCurrentStatus,
-    nextStatus: normalizedNextStatus,
-    byProvider,
-    references,
+  for (const reference of uniqueTextValues(targets)) {
+    await applyTo(reference)
   }
+
+  return outcome
 }
 
 async function normalizeExistingOrdersAndIndexes() {
@@ -3051,6 +3149,9 @@ export {
   getGodswayStatusDetails,
   isGodswayStatusEndpointUnavailable,
   getHubnetStatusDetails,
+  getWebhookEventStatus,
+  getHubnetWebhookStatusDetails,
+  isHubnetTransactionNotFoundResponse,
   sanitizeProviderMeta,
   toMoneyNumber,
   toMoneyUnits,
@@ -3087,6 +3188,8 @@ export {
   sanitizeUserProfileForClient,
   ensureUserAccountState,
   getUserRoleSummary,
+  listAdminUserIds,
+  setUserRoles,
   getUserAfaRegistrations,
   recordAuditEvent,
   getPurchaseIntentRef,
@@ -3124,9 +3227,11 @@ export {
   findOrderLocationByProviderLookup,
   findOrderLocationByLookupValue,
   createOrderRecord,
+  canApplyOrderStatus,
   updateOrderByReference,
   syncPurchaseIntentFromOrder,
   mergeOrderPayloadWithPurchaseIntent,
+  setOrderStatusManually,
   bulkUpdateOrdersStatus,
   normalizeExistingOrdersAndIndexes,
   backfillPurchaseIntentsFromOrders,
