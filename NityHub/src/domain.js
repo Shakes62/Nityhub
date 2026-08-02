@@ -11,6 +11,7 @@ import {
   ORDER_SYNC_STATE_PATH,
   INSTANCE_ID,
   DEFAULT_AFA_REGISTRATION_FEE,
+  MAX_AFA_REGISTRATION_FEE,
   PURCHASE_INTENT_PATH,
   DEFAULT_PACKAGE_CATALOG,
   ADMIN_ASSIGNABLE_ORDER_STATUSES,
@@ -21,6 +22,16 @@ import {
 import { admin, db } from "./firebase.js"
 import { logger } from "./logger.js"
 import { createAppError, getErrorCode, parseJsonText } from "./lib/errors.js"
+import {
+  normalizeNetwork,
+  normalizeProvider,
+  formatGodswayCapacityFromVolume,
+  buildDefaultProviderMappings,
+  normalizeProviderMappings,
+  describeProviderMappingGaps,
+  describeProviderMappingGapMessage,
+  isCompleteProviderMapping,
+} from "./lib/provider-mapping.js"
 import {
   fetchWithRetry,
   paystackCircuitBreaker,
@@ -46,6 +57,7 @@ import {
 import {
   extractGodswayOrderNumber,
   sanitizeGodswayProviderOrderNumber,
+  verifyGodswayWebhookSignature,
   firstNonEmptyText,
 } from "./lib/godsway.js"
 import {
@@ -334,96 +346,16 @@ async function checkHubnetBalance() {
   }
 }
 
-function normalizeNetwork(network) {
-  return String(network || "").trim().toLowerCase()
-}
+// normalizeNetwork / normalizeProvider / the provider-mapping rules now live in
+// ./lib/provider-mapping.js (imported at the top) and are re-exported below.
 
 function normalizePurchaseNetwork(network) {
   const safeNetwork = normalizeNetwork(network)
   return safeNetwork === "big-time" ? "at" : safeNetwork
 }
 
-function normalizeProvider(value, fallback = "") {
-  const provider = String(value || "").trim().toLowerCase()
-  return SUPPORTED_PROVIDERS.includes(provider) ? provider : fallback
-}
-
 function normalizeProviderRoutingValue(network, value) {
   return normalizeProvider(value, DEFAULT_PROVIDER_ROUTING[normalizeNetwork(network)] || "hubnet")
-}
-
-function formatGodswayCapacityFromVolume(volume) {
-  const amount = Number(volume || 0)
-  if (!Number.isFinite(amount) || amount <= 0) {
-    return ""
-  }
-
-  const inGb = amount / 1000
-  if (Number.isInteger(inGb)) {
-    return String(inGb)
-  }
-
-  return String(Math.round((inGb + Number.EPSILON) * 100) / 100).replace(/\.0+$/, "")
-}
-
-function buildDefaultProviderMappings(network, volume) {
-  const safeNetwork = normalizeNetwork(network)
-  const defaultGodswayNetworkKey =
-    safeNetwork === "mtn" ? "YELLO" : safeNetwork === "telecel" ? "TELECEL" : ""
-
-  return {
-    hubnet: {
-      network: safeNetwork,
-      volume: volume > 0 ? String(volume) : "",
-    },
-    godsway: {
-      networkKey: defaultGodswayNetworkKey,
-      capacity: formatGodswayCapacityFromVolume(volume),
-    },
-    gigshub: {
-      packageId: "",
-    },
-  }
-}
-
-function normalizeProviderMappings(network, rawMappings = {}, volume = 0) {
-  const defaults = buildDefaultProviderMappings(network, volume)
-  const source =
-    rawMappings && typeof rawMappings === "object" && !Array.isArray(rawMappings) ? rawMappings : {}
-
-  return {
-    hubnet: {
-      network: normalizeNetwork(source?.hubnet?.network || defaults.hubnet.network),
-      volume: String(source?.hubnet?.volume || defaults.hubnet.volume || "").trim(),
-    },
-    godsway: {
-      networkKey: String(source?.godsway?.networkKey || defaults.godsway.networkKey || "")
-        .trim()
-        .toUpperCase(),
-      capacity: String(source?.godsway?.capacity || defaults.godsway.capacity || "").trim(),
-    },
-    gigshub: {
-      packageId: String(source?.gigshub?.packageId || defaults.gigshub.packageId || "").trim(),
-    },
-  }
-}
-
-function isCompleteProviderMapping(network, provider, catalogEntry) {
-  const providerMappings = normalizeProviderMappings(network, catalogEntry?.providerMappings, catalogEntry?.volume)
-
-  if (provider === "hubnet") {
-    return Boolean(providerMappings.hubnet.network)
-  }
-
-  if (provider === "godsway") {
-    return Boolean(providerMappings.godsway.networkKey && providerMappings.godsway.capacity)
-  }
-
-  if (provider === "gigshub") {
-    return Boolean(providerMappings.gigshub.packageId)
-  }
-
-  return false
 }
 
 function getPackageProviderMapping(network, provider, catalogEntry) {
@@ -1148,9 +1080,50 @@ async function getEffectivePackagePrice(catalogEntry, uid) {
   return resolveEffectivePackagePrice(catalogEntry, { agentPricing })
 }
 
+function getAfaRegistrationFeeRef() {
+  return db.ref("settings/fees/afa")
+}
+
 async function getAfaRegistrationFee() {
-  const snapshot = await db.ref("settings/fees/afa").once("value")
+  const snapshot = await getAfaRegistrationFeeRef().once("value")
   return toMoneyNumber(snapshot.val(), DEFAULT_AFA_REGISTRATION_FEE)
+}
+
+/**
+ * Set the AFA registration fee charged by POST /api/afa/register.
+ *
+ * Writes the same `settings/fees/afa` node getAfaRegistrationFee() reads, so a
+ * change applies to the next registration without a redeploy. Bounded on both
+ * ends: a zero/negative fee would hand out free registrations and a fat-fingered
+ * amount would silently drain a customer's wallet, so both are refused here
+ * rather than at the till.
+ *
+ * Idempotent - re-sending the current fee reports `changed: false`.
+ */
+async function setAfaRegistrationFee(fee, { actorUid = "" } = {}) {
+  const amount = toMoneyNumber(fee, NaN)
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw createAppError("ADMIN_AFA_FEE_INVALID", {
+      providerMessage: "The AFA registration fee must be a positive amount.",
+    })
+  }
+
+  if (amount > MAX_AFA_REGISTRATION_FEE) {
+    throw createAppError("ADMIN_AFA_FEE_TOO_LARGE", {
+      providerMessage: `The AFA registration fee cannot exceed GHS ${MAX_AFA_REGISTRATION_FEE}.`,
+    })
+  }
+
+  const previous = await getAfaRegistrationFee()
+  if (previous === amount) {
+    return { fee: amount, previous, changed: false }
+  }
+
+  await getAfaRegistrationFeeRef().set(amount)
+  logger.info("AFA registration fee updated", { previous, fee: amount, actorUid })
+
+  return { fee: amount, previous, changed: true }
 }
 
 function sleep(ms) {
@@ -3194,12 +3167,15 @@ export {
   buildDefaultProviderMappings,
   normalizeProviderMappings,
   isCompleteProviderMapping,
+  describeProviderMappingGaps,
+  describeProviderMappingGapMessage,
   getPackageProviderMapping,
   isTerminalOrderStatus,
   normalizeInternalOrderStatus,
   getOrderStatusPriority,
   sanitizeGodswayProviderOrderNumber,
   extractGodswayOrderNumber,
+  verifyGodswayWebhookSignature,
   resolveStoredProviderOrderNumber,
   resolveStoredProviderReference,
   parseUtcDateBoundary,
@@ -3245,6 +3221,7 @@ export {
   resolveAgentPrice,
   resolveEffectivePackagePrice,
   getAfaRegistrationFee,
+  setAfaRegistrationFee,
   sleep,
   isTransientRealtimeDisconnectError,
   hashStableKey,

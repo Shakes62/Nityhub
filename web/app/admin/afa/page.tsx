@@ -1,9 +1,10 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { RefreshCw } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { RefreshCw, Save } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardHeader } from "@/components/ui/card";
+import { Field, Input, useFieldId } from "@/components/ui/field";
 import { PageHero } from "@/components/layout/page-hero";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState, ErrorState } from "@/components/ui/states";
@@ -16,8 +17,93 @@ import { RowActions } from "@/components/admin/row-actions";
 import { DetailGrid, DetailRow, DetailSection } from "@/components/admin/detail";
 import { formatDate, formatMoney, shortRef } from "@/lib/format";
 import { useAdminData } from "@/contexts/admin-data-context";
+import { useToast } from "@/contexts/toast-context";
+import { useAsyncData } from "@/hooks/use-async-data";
 import { useTable } from "@/hooks/use-table";
+import { ApiError } from "@/types/api";
+import { getAfaFee } from "@/services/api";
+import { updateAfaFee } from "@/services/admin";
 import type { AdminAfaRegistration } from "@/types/admin";
+
+/**
+ * The fee charged by POST /api/afa/register, stored server-side at
+ * settings/fees/afa. Editing it here takes effect on the next registration —
+ * existing rows keep the fee they were charged.
+ */
+function AfaFeeCard() {
+  const toast = useToast();
+  const feeQuery = useAsyncData(getAfaFee, []);
+  const [draft, setDraft] = useState("");
+  const [saving, setSaving] = useState(false);
+  const feeId = useFieldId("afa-fee");
+
+  useEffect(() => {
+    if (feeQuery.data != null) {
+      // Syncing loaded server data into local editable state.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setDraft(String(feeQuery.data));
+    }
+  }, [feeQuery.data]);
+
+  const save = async () => {
+    const amount = Number(draft);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      toast.error("Enter a fee greater than 0");
+      return;
+    }
+    setSaving(true);
+    try {
+      const result = await updateAfaFee(amount);
+      toast.success(
+        result.changed
+          ? `AFA fee set to ${formatMoney(result.fee)}`
+          : "That is already the current fee",
+      );
+      await feeQuery.reload();
+    } catch (err) {
+      toast.error(
+        err instanceof ApiError || err instanceof Error ? err.message : "Failed to update the AFA fee",
+      );
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Card className="flex flex-col gap-4">
+      <CardHeader
+        title="Registration fee"
+        description="Charged to the customer's wallet on every new AFA registration."
+      />
+      {feeQuery.loading && feeQuery.data == null ? (
+        <Skeleton className="h-12 rounded-lg" />
+      ) : feeQuery.error ? (
+        <ErrorState message={feeQuery.error} onRetry={feeQuery.reload} />
+      ) : (
+        <div className="flex flex-wrap items-end gap-3">
+          <Field label="Fee (GHS)" htmlFor={feeId} className="w-40">
+            <Input
+              id={feeId}
+              type="number"
+              min="0"
+              step="0.01"
+              className="h-10"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+            />
+          </Field>
+          <Button variant="primary" size="sm" onClick={save} loading={saving} className="mb-0.5">
+            <Save className="size-4" />
+            Save fee
+          </Button>
+          <p className="mb-2.5 text-xs text-muted">
+            Currently {formatMoney(feeQuery.data ?? 0)}. Applies to new registrations only.
+          </p>
+        </div>
+      )}
+    </Card>
+  );
+}
 
 export default function AdminAfaPage() {
   const { overview, loading, error, reload } = useAdminData();
@@ -58,6 +144,8 @@ export default function AdminAfaPage() {
           </Button>
         }
       />
+
+      <AfaFeeCard />
 
       <Card className="flex flex-col gap-4">
         <CardHeader

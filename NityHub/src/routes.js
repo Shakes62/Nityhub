@@ -14,6 +14,7 @@ import {
   DEFAULT_AFA_REGISTRATION_FEE,
   PURCHASE_INTENT_PATH,
   DEFAULT_PACKAGE_CATALOG,
+  WEBHOOK_SECRET_REQUIRED,
 } from "./config.js"
 import { admin, db } from "./firebase.js"
 import { logger } from "./logger.js"
@@ -69,6 +70,8 @@ import {
   buildDefaultProviderMappings,
   normalizeProviderMappings,
   isCompleteProviderMapping,
+  describeProviderMappingGaps,
+  describeProviderMappingGapMessage,
   getPackageProviderMapping,
   isTerminalOrderStatus,
   normalizeInternalOrderStatus,
@@ -119,6 +122,7 @@ import {
   resolveAgentPrice,
   resolveEffectivePackagePrice,
   getAfaRegistrationFee,
+  setAfaRegistrationFee,
   sleep,
   isTransientRealtimeDisconnectError,
   hashStableKey,
@@ -145,6 +149,8 @@ import {
   buildWalletPurchaseStateResponse,
   isWebhookIpAllowed,
   isValidWebhookToken,
+  extractGodswayOrderNumber,
+  verifyGodswayWebhookSignature,
   authenticateRequest,
   optionalAuthenticateRequest,
   requirePrivilegedAccess,
@@ -500,6 +506,177 @@ app.post("/webhook/gigshub", async (req, res) => {
   }
 })
 
+/**
+ * CK-Godsway webhook — HMAC-SHA256 over the raw body, per CK's published spec.
+ *
+ * CK registers ONE endpoint per account from its API Keys page. It does not
+ * carry the `?token=` query or the `x-webhook-secret` header that the generic
+ * /webhook route requires, so pointing CK at /webhook gets every delivery
+ * rejected 403 — and CK disables an endpoint after 10 consecutive failures.
+ *
+ * Because of that auto-disable rule, this route answers 200 for anything it
+ * simply cannot act on (an order we do not recognise, a replayed event) and
+ * reserves non-2xx for "we could not authenticate you" and genuine faults.
+ */
+app.post("/webhook/godsway", async (req, res) => {
+  try {
+    // Captured by the global JSON parser's verify hook — that parser runs
+    // first, so an express.raw() here would be skipped and the HMAC would be
+    // computed over the string "[object Object]".
+    const rawBody = Buffer.isBuffer(req.rawBody) ? req.rawBody : null
+    if (!rawBody) {
+      logger.warn("[CK WEBHOOK] Rejected: raw body unavailable", { ip: req.ip })
+      return res.status(400).json({ status: false, message: "Invalid webhook payload" })
+    }
+
+    const secret = String(CONFIG.godswayWebhookSecret || "").trim()
+    if (!secret) {
+      // Fail closed in production: an unauthenticated endpoint lets anyone mark
+      // any Telecel order delivered, which suppresses reconciliation and blocks
+      // the refund that a genuinely failed order is owed.
+      if (WEBHOOK_SECRET_REQUIRED) {
+        logger.error("[CK WEBHOOK] Rejected: GODSWAY_WEBHOOK_SECRET is not configured")
+        return res.status(403).json({ status: false, message: "Webhook not authorized" })
+      }
+      logger.warn("[CK WEBHOOK] Accepting unsigned delivery: GODSWAY_WEBHOOK_SECRET is not set")
+    } else if (!verifyGodswayWebhookSignature(rawBody, req.headers["x-webhook-signature"], secret)) {
+      logger.warn("[CK WEBHOOK] Rejected: invalid signature", {
+        ip: req.ip,
+        deliveryId: String(req.headers["x-webhook-delivery"] || "").trim() || null,
+      })
+      return res.status(403).json({ status: false, message: "Invalid webhook signature" })
+    }
+
+    let payload
+    try {
+      payload = JSON.parse(rawBody.toString("utf8"))
+    } catch {
+      return res.status(400).json({ status: false, message: "Invalid JSON payload" })
+    }
+
+    const event = String(payload?.event || req.headers["x-webhook-event"] || "").trim()
+    // CK's own docs say to dedupe on the top-level id, which is stable across
+    // its retries (attempt increments, id does not).
+    const eventId = String(payload?.id || req.headers["x-webhook-event-id"] || "").trim()
+    const dedupeKey = eventId ? `godsway_event:${eventId}` : ""
+    if (dedupeKey && processedTransactions.has(dedupeKey)) {
+      logger.info("[CK WEBHOOK] Duplicate delivery ignored", { eventId, event })
+      return res.status(200).json({ status: true, message: "Duplicate event ignored" })
+    }
+
+    const data = payload?.data && typeof payload.data === "object" ? payload.data : {}
+    // data.reference is OUR reference (we send it on /data-purchase); orderNumber
+    // is CK's. Try ours first, then theirs.
+    const appReference = String(data.reference || "").trim()
+    const godswayOrderNumber = extractGodswayOrderNumber(payload)
+
+    let located = null
+    for (const candidate of [appReference, godswayOrderNumber].filter(Boolean)) {
+      located = await findOrderLocationByLookupValue(candidate, {
+        includeOrder: true,
+        provider: "godsway",
+      })
+      if (located) break
+    }
+
+    if (!located) {
+      logger.warn("[CK WEBHOOK] Order not found", { appReference, godswayOrderNumber, event })
+      if (dedupeKey) processedTransactions.add(dedupeKey, { event, matched: false })
+      return res.status(200).json({ status: true, message: "Order not found, no update performed" })
+    }
+
+    const reference = String(located.order?.reference || "").trim()
+    if (!reference) {
+      if (dedupeKey) processedTransactions.add(dedupeKey, { event, matched: false })
+      return res.status(200).json({ status: true, message: "Could not resolve app reference" })
+    }
+
+    // The event name is authoritative; data.status is the fallback for an event
+    // we do not recognise.
+    const statusDetails = getGodswayStatusDetails(payload)
+    const eventStatus = getWebhookEventStatus(event)
+    const normalizedStatus = eventStatus || statusDetails.normalizedStatus
+    const providerStatusRaw = event || statusDetails.providerStatusRaw || ""
+    const providerStatusDescription =
+      statusDetails.providerStatusDescription || String(payload?.message || "").trim()
+    const updatedAt = Date.now()
+
+    const providerOrderNumber = resolveStoredProviderOrderNumber(
+      "godsway",
+      godswayOrderNumber || located.order?.providerOrderNumber || "",
+      reference,
+    )
+    const providerReference = resolveStoredProviderReference(
+      "godsway",
+      godswayOrderNumber || located.order?.providerReference || "",
+      reference,
+      providerOrderNumber || "",
+    )
+
+    const updateResult = await updateOrderByReference(reference, {
+      provider: "godsway",
+      providerReference,
+      providerOrderNumber,
+      providerStatusRaw,
+      providerStatusDescription,
+      status: normalizedStatus,
+      statusSource: "webhook",
+      statusUpdatedAt: updatedAt,
+      updatedAt,
+      sync: {
+        lastAttemptAt: updatedAt,
+        lastSuccessAt: updatedAt,
+        lastError: "",
+        lastProviderStatusRaw: providerStatusRaw,
+      },
+    })
+
+    // Mirror what was actually stored: the monotonic guard drops replayed or
+    // out-of-order callbacks, so the order may not hold the status we asked for.
+    const appliedStatus = normalizeInternalOrderStatus(updateResult.order?.status, normalizedStatus)
+
+    await upsertPurchaseIntent(reference, {
+      provider: "godsway",
+      providerReference,
+      providerOrderNumber: providerOrderNumber || "",
+      providerStatusRaw,
+      providerStatusDescription,
+      statusSource: "webhook",
+      orderStatus: appliedStatus,
+      providerSubmissionStatus: isTerminalOrderStatus(appliedStatus) ? "completed" : "submitted",
+      paymentStatus: "success",
+      errorMessage: "",
+    }).catch(() => null)
+
+    processedTransactions.add(reference, {
+      reference,
+      provider: "godsway",
+      providerReference,
+      providerOrderNumber,
+      status: appliedStatus,
+      providerStatusRaw,
+      updatedFrom: "webhook",
+      updatedAt,
+    })
+    if (dedupeKey) processedTransactions.add(dedupeKey, { event, matched: true, reference })
+
+    logger.info(`[CK WEBHOOK] Order ${reference} updated`, {
+      event,
+      eventId: eventId || null,
+      attempt: Number(payload?.attempt || req.headers["x-webhook-attempt"] || 0) || null,
+      requestedStatus: normalizedStatus,
+      status: appliedStatus,
+      statusApplied: updateResult.statusApplied !== false,
+      providerOrderNumber,
+    })
+
+    return res.status(200).json({ status: true, message: "Webhook processed and order updated" })
+  } catch (error) {
+    logger.error("CK-Godsway webhook processing failed", error)
+    return res.status(500).json({ status: false, message: "Webhook processing failed" })
+  }
+})
+
 // Update Hubnet payload to include webhook
 app.get("/health", (req, res) => {
   const memUsage = process.memoryUsage()
@@ -525,6 +702,10 @@ app.get("/health", (req, res) => {
       // through logs: when this is false in production every inbound provider
       // webhook is rejected and order statuses only advance via polling.
       webhookSecretConfigured: Boolean(CONFIG.providerWebhookSecret),
+      // Separate from the above: CK-Godsway signs with its own dashboard
+      // secret. Without it, /webhook/godsway rejects every delivery and CK
+      // disables the endpoint after 10 consecutive failures.
+      godswayWebhookSecretConfigured: Boolean(CONFIG.godswayWebhookSecret),
       webhookIpAllowlist: CONFIG.providerWebhookAllowedIps.length,
     },
     orderStatusSync: {
@@ -600,9 +781,18 @@ app.get("/api/admin/packages/:network", authenticateRequest, requirePrivilegedAc
   try {
     const activeProvider = await getActiveProviderForNetwork(network)
     const rows = await getCatalogPackages(network, { includeDisabled: true })
+    // Ship the completeness verdict with each row. The admin editor used to
+    // infer it from "does providerMappings[provider] exist", which is not the
+    // rule the save path enforces - a row with an empty networkKey rendered as
+    // "Mapped" and was then rejected on save with no indication of which row.
+    const data = rows.map((entry) => ({
+      ...entry,
+      mappingMissing: describeProviderMappingGaps(network, activeProvider, entry).missing,
+    }))
+
     return res.json({
       status: "success",
-      data: rows,
+      data,
       activeProvider,
       timestamp: new Date().toISOString(),
     })
@@ -665,7 +855,7 @@ app.put("/api/admin/provider-routing", authenticateRequest, requirePrivilegedAcc
       if (invalidEntry) {
         return res.status(400).json({
           status: "error",
-          message: `Cannot route ${network.toUpperCase()} to ${routing[network]} until package ${invalidEntry.label} has complete provider mapping.`,
+          message: `Cannot route ${network.toUpperCase()} to ${routing[network]}. ${describeProviderMappingGapMessage(network, routing[network], invalidEntry)}`,
           timestamp: new Date().toISOString(),
         })
       }
@@ -785,7 +975,7 @@ app.put("/api/admin/packages/:network", authenticateRequest, requirePrivilegedAc
     if (invalidEntry) {
       return res.status(400).json({
         status: "error",
-        message: `Package ${invalidEntry.label} is missing ${activeProvider} mapping for the current route.`,
+        message: describeProviderMappingGapMessage(network, activeProvider, invalidEntry),
         timestamp: new Date().toISOString(),
       })
     }
@@ -1276,6 +1466,57 @@ app.get("/api/afa/fee", async (req, res) => {
     return res.status(500).json({
       status: "error",
       message: "Failed to load AFA registration fee",
+      timestamp: new Date().toISOString(),
+    })
+  }
+})
+
+/**
+ * Set the AFA registration fee. The public GET /api/afa/fee above serves the
+ * current value, so there is no admin-only read counterpart.
+ */
+app.put("/api/admin/afa/fee", authenticateRequest, requirePrivilegedAccess, adminMutationRateLimit, async (req, res) => {
+  const requestedFee = req.body?.fee
+
+  try {
+    const result = await setAfaRegistrationFee(requestedFee, { actorUid: req.authUser.uid })
+
+    await recordAuditEvent({
+      actorUid: req.authUser.uid,
+      actorEmail: req.authUser.email || null,
+      action: "admin.afa_fee.update",
+      status: "success",
+      metadata: { fee: result.fee, previous: result.previous, changed: result.changed },
+    }).catch(() => null)
+
+    return res.json({
+      status: "success",
+      message: result.changed
+        ? `AFA registration fee set to GHS ${result.fee.toFixed(2)}`
+        : "AFA registration fee is already that amount",
+      data: result,
+      timestamp: new Date().toISOString(),
+    })
+  } catch (error) {
+    const errorCode = getErrorCode(error)
+    const isClientError = ["ADMIN_AFA_FEE_INVALID", "ADMIN_AFA_FEE_TOO_LARGE"].includes(errorCode)
+
+    if (!isClientError) {
+      logger.error("Failed to update AFA fee", error, { uid: req.authUser.uid, requestedFee })
+    }
+
+    await recordAuditEvent({
+      actorUid: req.authUser.uid,
+      actorEmail: req.authUser.email || null,
+      action: "admin.afa_fee.update",
+      status: "failed",
+      metadata: { requestedFee, error: error?.providerMessage || error?.message || "Unknown error" },
+    }).catch(() => null)
+
+    return res.status(isClientError ? 400 : 500).json({
+      status: "error",
+      errorCode: errorCode || undefined,
+      message: isClientError ? error.providerMessage : "Failed to update the AFA registration fee",
       timestamp: new Date().toISOString(),
     })
   }

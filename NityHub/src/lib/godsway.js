@@ -3,6 +3,8 @@
 // Free of Firebase imports so the provider-order-number handling - which
 // determines whether an order can ever be status-polled - is unit testable.
 
+import crypto from "crypto"
+
 /** First non-empty trimmed string from a list of candidates. */
 export function firstNonEmptyText(values = []) {
   for (const value of values) {
@@ -41,6 +43,34 @@ export function extractGodswayOrderNumber(response = {}) {
  * Polling Godsway with the app reference always fails, so a value that echoes
  * it is worse than useless - it makes the order look pollable when it is not.
  */
+/**
+ * Constant-time check of CK-Godsway's `X-Webhook-Signature` header.
+ *
+ * The header is the hex HMAC-SHA256 of the exact bytes CK sent, so this takes
+ * the raw body buffer: re-serialising the parsed JSON changes key order and
+ * whitespace and would never match.
+ *
+ * Anything that is not a 64-char hex string is rejected before the compare,
+ * both because timingSafeEqual throws on a length mismatch and because a
+ * malformed header is never a genuine CK delivery.
+ */
+export function verifyGodswayWebhookSignature(rawBody, signature, secret) {
+  const safeSecret = String(secret || "")
+  const safeSignature = String(signature || "").trim()
+
+  if (!safeSecret || !Buffer.isBuffer(rawBody) || !/^[a-f0-9]{64}$/i.test(safeSignature)) {
+    return false
+  }
+
+  const expected = crypto.createHmac("sha256", safeSecret).update(rawBody).digest("hex")
+
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(safeSignature, "hex"))
+  } catch {
+    return false
+  }
+}
+
 export function sanitizeGodswayProviderOrderNumber(value, appReference = "") {
   const safeValue = String(value || "").trim()
   const safeAppReference = String(appReference || "").trim()

@@ -93,6 +93,14 @@ will not boot without Firebase credentials:
 | `ADDITIONAL_ALLOWED_ORIGINS` | Comma-separated CORS allowlist. Must include the Vercel domain, or the browser blocks every API call. |
 | `PORT` | Usually injected by the host |
 
+Optional, but needed for specific routes:
+
+| Variable | Notes |
+| --- | --- |
+| `GODSWAY_WEBHOOK_SECRET` | Signing secret from CK-Godsway's **API Keys** page, where you must also register `https://<APP_URL>/webhook/godsway` as the endpoint. CK signs each delivery with a hex HMAC-SHA256 of the raw body; this is **not** the same value as `PROVIDER_WEBHOOK_SECRET`. Unset in production means every CK delivery is rejected, and CK auto-disables the endpoint after 10 consecutive failures. Check `/health` → `security.godswayWebhookSecretConfigured`. |
+| `GODSWAY_AT_NETWORK_KEY` | CK-Godsway's AirtelTigo network code. Unset by default because we have no documented value — leave it blank and AT packages report `networkKey` missing, which blocks routing AT to CK-Godsway (MTN defaults to `YELLO`, Telecel to `TELECEL`). Can also be set per package under Catalog → Packages → Mapping. |
+| `GODSWAY_MTN_NETWORK_KEY` / `GODSWAY_TELECEL_NETWORK_KEY` | Override the `YELLO` / `TELECEL` defaults if CK changes them. |
+
 ---
 
 ## 3. Wiring the two together

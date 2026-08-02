@@ -41,6 +41,23 @@ export const CONFIG = {
   godswayApiKey: process.env.GODSWAY_API_KEY || process.env.TELECEL_API_KEY,
   godswayBaseUrl: process.env.GODSWAY_BASE_URL || "https://console.ckgodsway.com/api",
   godswayStatusUrl: process.env.GODSWAY_STATUS_URL || "",
+  // CK-Godsway addresses each network by its own key, sent as `networkKey` on
+  // /data-purchase. Only MTN (YELLO) and Telecel (TELECEL) have keys we know,
+  // so AirtelTigo defaults to blank rather than to a guess: a wrong key is
+  // accepted at config time and only fails once a customer has been charged.
+  // Set GODSWAY_AT_NETWORK_KEY to CK's AirtelTigo code to route AT to them, or
+  // fill `networkKey` per package in Catalog → Packages → Mapping.
+  // CK-Godsway signs each webhook delivery with an HMAC of the raw body, using
+  // the signing secret shown on its API Keys page. This is a different value
+  // from PROVIDER_WEBHOOK_SECRET (which is ours, not CK's) and must not fall
+  // back to it — a wrong secret rejects every delivery, and CK disables the
+  // endpoint after 10 consecutive failures.
+  godswayWebhookSecret: process.env.GODSWAY_WEBHOOK_SECRET || "",
+  godswayNetworkKeys: {
+    mtn: String(process.env.GODSWAY_MTN_NETWORK_KEY || "YELLO").trim().toUpperCase(),
+    at: String(process.env.GODSWAY_AT_NETWORK_KEY || "").trim().toUpperCase(),
+    telecel: String(process.env.GODSWAY_TELECEL_NETWORK_KEY || "TELECEL").trim().toUpperCase(),
+  },
   gigshubApiKey: process.env.GIGSHUB_API_KEY,
   gigshubBaseUrl: process.env.GIGSHUB_BASE_URL || "https://gigshub.store/api/v1",
   providerWebhookSecret: process.env.PROVIDER_WEBHOOK_SECRET || process.env.WEBHOOK_SECRET || "",
@@ -123,6 +140,8 @@ export const REFUND_DLQ_PATH = "refund_dead_letters"
 export const REFUND_LEASE_PATH = "system_leases/refund_worker"
 export const INSTANCE_ID = crypto.randomBytes(4).toString("hex")
 export const DEFAULT_AFA_REGISTRATION_FEE = 6
+/** Sanity ceiling on the admin-settable AFA fee, so a typo cannot bill GHS 6000. */
+export const MAX_AFA_REGISTRATION_FEE = 1000
 export const PURCHASE_INTENT_PATH = "purchase_intents"
 export const DEFAULT_PACKAGE_CATALOG = {
   mtn: [

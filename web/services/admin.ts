@@ -3,6 +3,7 @@ import type {
   AdminCatalogResult,
   AdminOverview,
   AdminPackage,
+  AfaFeeResult,
   BulkStatusResult,
   OrderStatusResult,
   ProviderHealthData,
@@ -159,4 +160,19 @@ export async function getProviderHealth(): Promise<ProviderHealthData> {
     auth: true,
   });
   return res.data ?? {};
+}
+
+/* ---------------------------------- AFA ---------------------------------- */
+
+/**
+ * Set the AFA registration fee (GHS). Reading it back is the public
+ * `getAfaFee()` in services/api.ts — there is no admin-only read.
+ */
+export async function updateAfaFee(fee: number): Promise<AfaFeeResult> {
+  const res = await apiRequest<AfaFeeResult>("/api/admin/afa/fee", {
+    method: "PUT",
+    json: { fee },
+    auth: true,
+  });
+  return res.data as AfaFeeResult;
 }

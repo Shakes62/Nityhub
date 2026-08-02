@@ -95,8 +95,35 @@ export interface AdminPackage {
   updatedAt?: number;
   updatedBy?: string;
   providerMappings?: Record<string, unknown>;
+  /**
+   * Required mapping fields this package leaves blank for the network's active
+   * provider, computed by the backend (read-only — never sent back on save).
+   * Empty means the row will pass the save/routing validation.
+   */
+  mappingMissing?: string[];
   [key: string]: unknown;
 }
+
+/** One field a provider needs in a package's `providerMappings`. */
+export interface ProviderMappingField {
+  key: string;
+  label: string;
+  hint: string;
+}
+
+/**
+ * Labels for the mapping editor. The backend is the authority on whether a
+ * mapping is complete (it returns `mappingMissing`); this map only decides
+ * which inputs to render and what to call them.
+ */
+export const PROVIDER_MAPPING_FIELDS: Record<string, ProviderMappingField[]> = {
+  hubnet: [{ key: "network", label: "Network", hint: "Hubnet network slug — mtn, at or telecel" }],
+  godsway: [
+    { key: "networkKey", label: "Network key", hint: "CK-Godsway network code — YELLO for MTN, TELECEL for Telecel" },
+    { key: "capacity", label: "Capacity (GB)", hint: "Bundle size in GB, e.g. 1 or 1.5" },
+  ],
+  gigshub: [{ key: "packageId", label: "Package ID", hint: "The GiGSHUB plan id for this bundle" }],
+};
 
 /** GET /api/admin/packages/:network */
 export interface AdminCatalogResult {
@@ -154,6 +181,13 @@ export interface BulkStatusResult {
   byProvider?: Record<string, number>;
   references?: string[];
   failures: BulkStatusFailure[];
+}
+
+/** PUT /api/admin/afa/fee — `changed` is false when the fee was already set. */
+export interface AfaFeeResult {
+  fee: number;
+  previous: number;
+  changed: boolean;
 }
 
 /** Networks supported by the catalog/routing endpoints. */

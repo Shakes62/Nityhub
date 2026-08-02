@@ -15,7 +15,7 @@ import { NetworkDot } from "@/components/ui/network-dot";
 import { useToast } from "@/contexts/toast-context";
 import { useAsyncData } from "@/hooks/use-async-data";
 import { ApiError } from "@/types/api";
-import { ADMIN_NETWORKS, ADMIN_PROVIDERS } from "@/types/admin";
+import { ADMIN_NETWORKS, ADMIN_PROVIDERS, PROVIDER_MAPPING_FIELDS } from "@/types/admin";
 import type { AdminPackage, ProviderRouting } from "@/types/admin";
 import {
   getAdminPackages,
@@ -38,6 +38,10 @@ interface EditRow {
   sortOrder: string;
   enabled: boolean;
   providerMappings: Record<string, unknown>;
+  /** Fields the backend says are blank for the active provider (server truth). */
+  mappingMissing: string[];
+  /** Mapping edited since the last load, so the server verdict is stale. */
+  mappingDirty: boolean;
 }
 
 function toEditRow(p: AdminPackage): EditRow {
@@ -51,6 +55,8 @@ function toEditRow(p: AdminPackage): EditRow {
     sortOrder: p.sortOrder != null ? String(p.sortOrder) : "",
     enabled: p.enabled !== false,
     providerMappings: (p.providerMappings as Record<string, unknown>) || {},
+    mappingMissing: Array.isArray(p.mappingMissing) ? p.mappingMissing : [],
+    mappingDirty: false,
   };
 }
 
@@ -65,6 +71,16 @@ function toPackage(r: EditRow): AdminPackage {
     enabled: r.enabled,
     providerMappings: r.providerMappings,
   } as AdminPackage;
+}
+
+/** Pull one provider's mapping values out of a package, as editable strings. */
+function readProviderFields(
+  providerMappings: Record<string, unknown> | undefined,
+  provider: string,
+): Record<string, string> {
+  const mapping = (providerMappings?.[provider] as Record<string, unknown>) ?? {};
+  const fields = PROVIDER_MAPPING_FIELDS[provider] ?? [];
+  return Object.fromEntries(fields.map((f) => [f.key, String(mapping[f.key] ?? "")]));
 }
 
 /* ------------------------------ Health render ------------------------------ */
@@ -101,7 +117,9 @@ export default function AdminCatalogPage() {
   const [rows, setRows] = useState<EditRow[]>([]);
   const [savingPackages, setSavingPackages] = useState(false);
   const [mappingKey, setMappingKey] = useState<string | null>(null);
+  const [mappingFields, setMappingFields] = useState<Record<string, string>>({});
   const [mappingText, setMappingText] = useState("");
+  const [showRawMapping, setShowRawMapping] = useState(false);
 
   const [routingDraft, setRoutingDraft] = useState<ProviderRouting>({});
   const [savingRouting, setSavingRouting] = useState(false);
@@ -143,6 +161,8 @@ export default function AdminCatalogPage() {
         sortOrder: "",
         enabled: false,
         providerMappings: {},
+        mappingMissing: [],
+        mappingDirty: true,
       },
     ]);
   };
@@ -169,19 +189,42 @@ export default function AdminCatalogPage() {
 
   const openMapping = (row: EditRow) => {
     setMappingKey(row._key);
+    setMappingFields(readProviderFields(row.providerMappings, activeProvider));
     setMappingText(JSON.stringify(row.providerMappings ?? {}, null, 2));
+    setShowRawMapping(false);
   };
 
+  /**
+   * Merge the edited fields back over the row's existing mapping. Only the
+   * active provider's fields are touched, so a package that also carries a
+   * mapping for another provider keeps it.
+   */
   const saveMapping = () => {
     if (!mappingKey) return;
-    let parsed: Record<string, unknown>;
-    try {
-      parsed = mappingText.trim() ? JSON.parse(mappingText) : {};
-    } catch {
-      toast.error("Provider mapping is not valid JSON");
-      return;
+
+    let next: Record<string, unknown>;
+    if (showRawMapping) {
+      try {
+        next = mappingText.trim() ? (JSON.parse(mappingText) as Record<string, unknown>) : {};
+      } catch {
+        toast.error("Provider mapping is not valid JSON");
+        return;
+      }
+    } else {
+      if (!activeProvider) {
+        toast.error("Set a provider for this network under Provider routing first");
+        return;
+      }
+      const row = rows.find((r) => r._key === mappingKey);
+      const base = { ...(row?.providerMappings ?? {}) } as Record<string, unknown>;
+      const existing = (base[activeProvider] as Record<string, unknown>) ?? {};
+      next = {
+        ...base,
+        [activeProvider]: { ...existing, ...mappingFields },
+      };
     }
-    updateRow(mappingKey, { providerMappings: parsed });
+
+    updateRow(mappingKey, { providerMappings: next, mappingDirty: true });
     setMappingKey(null);
     toast.info("Mapping staged — remember to save the catalog");
   };
@@ -342,8 +385,19 @@ export default function AdminCatalogPage() {
                     </tr>
                   ) : (
                     rows.map((r) => {
-                      const hasMapping =
-                        activeProvider && r.providerMappings && r.providerMappings[activeProvider] != null;
+                      // Server truth, not "does the key exist": a row can carry
+                      // a godsway mapping whose networkKey is blank, which the
+                      // save path rejects. Locally-edited mappings are unverified
+                      // until the next save+reload, so they say so.
+                      const mappingBadge = r.mappingDirty
+                        ? { tone: "info" as const, text: "Edited", title: "Save the catalog to verify this mapping" }
+                        : r.mappingMissing.length === 0
+                          ? { tone: "success" as const, text: "Mapped", title: `Complete for ${activeProvider}` }
+                          : {
+                              tone: "warning" as const,
+                              text: `Missing ${r.mappingMissing.join(", ")}`,
+                              title: `${activeProvider} needs ${r.mappingMissing.join(" and ")} — click to set`,
+                            };
                       return (
                         <tr key={r._key}>
                           <Td className="min-w-[8rem]">
@@ -410,11 +464,9 @@ export default function AdminCatalogPage() {
                               type="button"
                               onClick={() => openMapping(r)}
                               className="inline-flex items-center gap-1.5"
-                              title="Edit provider mapping JSON"
+                              title={mappingBadge.title}
                             >
-                              <Badge tone={hasMapping ? "success" : "warning"}>
-                                {hasMapping ? "Mapped" : "Edit"}
-                              </Badge>
+                              <Badge tone={mappingBadge.tone}>{mappingBadge.text}</Badge>
                             </button>
                           </Td>
                           <Td className="text-right">
@@ -488,7 +540,11 @@ export default function AdminCatalogPage() {
         open={mappingKey !== null}
         onClose={() => setMappingKey(null)}
         title="Provider mapping"
-        description="Advanced: raw JSON mapping used by upstream providers."
+        description={
+          activeProvider
+            ? `What ${activeProvider} needs to fulfil this package on ${network.toUpperCase()}.`
+            : "Values used by the upstream provider."
+        }
         size="lg"
         footer={
           <>
@@ -501,13 +557,52 @@ export default function AdminCatalogPage() {
           </>
         }
       >
-        <textarea
-          value={mappingText}
-          onChange={(e) => setMappingText(e.target.value)}
-          spellCheck={false}
-          rows={14}
-          className="w-full rounded-md border border-border bg-surface p-3 font-mono text-xs text-ink focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/25"
-        />
+        <div className="flex flex-col gap-4">
+          {showRawMapping ? (
+            <textarea
+              value={mappingText}
+              onChange={(e) => setMappingText(e.target.value)}
+              spellCheck={false}
+              rows={14}
+              aria-label="Provider mapping JSON"
+              className="w-full rounded-md border border-border bg-surface p-3 font-mono text-xs text-ink focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/25"
+            />
+          ) : (
+            <div className="flex flex-col gap-4">
+              {(PROVIDER_MAPPING_FIELDS[activeProvider] ?? []).map((field) => (
+                <Field
+                  key={field.key}
+                  label={field.label}
+                  hint={field.hint}
+                  htmlFor={`mapping-${field.key}`}
+                >
+                  <Input
+                    id={`mapping-${field.key}`}
+                    value={mappingFields[field.key] ?? ""}
+                    onChange={(e) =>
+                      setMappingFields((prev) => ({ ...prev, [field.key]: e.target.value }))
+                    }
+                    spellCheck={false}
+                  />
+                </Field>
+              ))}
+              {(PROVIDER_MAPPING_FIELDS[activeProvider] ?? []).length === 0 ? (
+                <p className="text-sm text-muted">
+                  No active provider for this network yet — set one under Provider routing first, or
+                  edit the raw JSON below.
+                </p>
+              ) : null}
+            </div>
+          )}
+
+          <button
+            type="button"
+            onClick={() => setShowRawMapping((v) => !v)}
+            className="self-start text-xs font-medium text-muted underline underline-offset-2 hover:text-ink-soft"
+          >
+            {showRawMapping ? "Back to fields" : "Edit raw JSON (all providers)"}
+          </button>
+        </div>
       </Modal>
     </>
   );
