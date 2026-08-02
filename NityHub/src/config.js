@@ -38,7 +38,10 @@ export const CONFIG = {
   hubnetStatusUrl:
     process.env.HUBNET_STATUS_URL || process.env.HUBNET_ORDER_STATUS_URL || HUBNET_DEFAULT_STATUS_URL,
   paystackSecretKey: process.env.PAYSTACK_SECRET_KEY,
-  godswayApiKey: process.env.GODSWAY_API_KEY || process.env.TELECEL_API_KEY,
+  // Telecel is served by CK-Godsway, so there is one key for both. There is no
+  // separate TELECEL_API_KEY — a second key just goes stale and silently loses
+  // to this one.
+  godswayApiKey: process.env.GODSWAY_API_KEY,
   godswayBaseUrl: process.env.GODSWAY_BASE_URL || "https://console.ckgodsway.com/api",
   godswayStatusUrl: process.env.GODSWAY_STATUS_URL || "",
   // CK-Godsway addresses each network by its own key, sent as `networkKey` on
