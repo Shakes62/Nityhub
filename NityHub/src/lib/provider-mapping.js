@@ -6,6 +6,7 @@
 // networkKey - is unit testable in isolation.
 
 import { CONFIG, SUPPORTED_PROVIDERS } from "../config.js"
+import { formatPbmhubSizeFromVolume } from "./pbmhub.js"
 
 export function normalizeNetwork(network) {
   return String(network || "").trim().toLowerCase()
@@ -42,6 +43,11 @@ export function buildDefaultProviderMappings(network, volume) {
   const defaultGodswayNetworkKey = String(CONFIG.godswayNetworkKeys?.[safeNetwork] || "")
     .trim()
     .toUpperCase()
+  // PBM HUB publishes an id for all three of our networks, so unlike the
+  // CK-Godsway key above this default is never blank for a supported network.
+  const defaultPbmhubNetwork = String(CONFIG.pbmhubNetworkIds?.[safeNetwork] || "")
+    .trim()
+    .toLowerCase()
 
   return {
     hubnet: {
@@ -54,6 +60,10 @@ export function buildDefaultProviderMappings(network, volume) {
     },
     gigshub: {
       packageId: "",
+    },
+    pbmhub: {
+      network: defaultPbmhubNetwork,
+      size: formatPbmhubSizeFromVolume(volume),
     },
   }
 }
@@ -77,6 +87,14 @@ export function normalizeProviderMappings(network, rawMappings = {}, volume = 0)
     gigshub: {
       packageId: String(source?.gigshub?.packageId || defaults.gigshub.packageId || "").trim(),
     },
+    pbmhub: {
+      network: String(source?.pbmhub?.network || defaults.pbmhub.network || "")
+        .trim()
+        .toLowerCase(),
+      // Case-preserving: PBM HUB matches `size` against its own catalog
+      // strings ("1GB"), and lower-casing it here would stop it resolving.
+      size: String(source?.pbmhub?.size || defaults.pbmhub.size || "").trim(),
+    },
   }
 }
 
@@ -85,6 +103,7 @@ export const PROVIDER_MAPPING_REQUIRED_FIELDS = {
   hubnet: ["network"],
   godsway: ["networkKey", "capacity"],
   gigshub: ["packageId"],
+  pbmhub: ["network", "size"],
 }
 
 /**

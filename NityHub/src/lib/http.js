@@ -20,7 +20,16 @@ export class CircuitBreaker {
         logger.info(`Circuit breaker ${this.name} transitioning to HALF_OPEN`)
       } else {
         logger.warn(`Circuit breaker ${this.name} is OPEN, rejecting request`)
-        throw new Error(`Service temporarily unavailable - ${this.name}`)
+        // Tagged so callers can tell a locally-rejected request from one that
+        // actually reached the provider. Nothing was sent here, so the order
+        // cannot be live upstream: the caller must fail (and refund) rather
+        // than hold the debit as an uncertain outcome. The provider name is
+        // kept out of the message because that message reaches buyers; it
+        // travels in `breaker` for the logs instead.
+        throw createAppError("Service temporarily unavailable. Please try again shortly.", {
+          code: "CIRCUIT_OPEN",
+          breaker: this.name,
+        })
       }
     }
 
@@ -70,7 +79,16 @@ export const paystackCircuitBreaker = new CircuitBreaker(3, 10000, "paystack")
 export const hubnetCircuitBreaker = new CircuitBreaker(3, 15000, "hubnet")
 export const godswayCircuitBreaker = new CircuitBreaker(3, 15000, "godsway")
 export const gigshubCircuitBreaker = new CircuitBreaker(3, 15000, "gigshub")
+export const pbmhubCircuitBreaker = new CircuitBreaker(3, 15000, "pbmhub")
 
+/**
+ * @param config.includeResponseMeta  Resolve to `{ data, statusCode }` instead
+ *   of the bare parsed body. PBM HUB needs it: it answers a network timeout
+ *   with 202 and a held (not reversed) debit, which is the one 2xx that must
+ *   never be treated as a completed purchase — and the status code is the only
+ *   thing that distinguishes it. Off by default, so existing callers are
+ *   unaffected.
+ */
 export const fetchWithRetry = async (url, options = {}, config = {}) => {
   const {
     maxRetries = CONFIG.maxRetries,
@@ -78,6 +96,7 @@ export const fetchWithRetry = async (url, options = {}, config = {}) => {
     maxDelay = CONFIG.maxDelay,
     timeout = CONFIG.requestTimeout,
     circuitBreaker = null,
+    includeResponseMeta = false,
   } = config
 
   let lastError = null
@@ -135,7 +154,7 @@ export const fetchWithRetry = async (url, options = {}, config = {}) => {
         const data = parseJsonText(text, { raw: text })
 
         logger.debug(`Request successful`, { url, attempt: attempt + 1 })
-        return data
+        return includeResponseMeta ? { data, statusCode: response.status } : data
       } catch (error) {
         lastError = error
 

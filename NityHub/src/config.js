@@ -63,6 +63,19 @@ export const CONFIG = {
   },
   gigshubApiKey: process.env.GIGSHUB_API_KEY,
   gigshubBaseUrl: process.env.GIGSHUB_BASE_URL || "https://gigshub.store/api/v1",
+  // PBM HUB Developer Platform. Every endpoint lives under <base>/api/v1 and
+  // takes the key as a plain Bearer token.
+  pbmhubApiKey: process.env.PBMHUB_API_KEY,
+  pbmhubBaseUrl: process.env.PBMHUB_BASE_URL || "https://developer.pbmhub.pro",
+  // PBM HUB addresses each network by its own id, sent as `network` on
+  // /purchase. Unlike CK-Godsway, all three of our networks have a documented
+  // id, so every default here is a real value rather than a guess. Override per
+  // package under Catalog → Packages → Mapping if an account differs.
+  pbmhubNetworkIds: {
+    mtn: String(process.env.PBMHUB_MTN_NETWORK_ID || "mtnup2u").trim().toLowerCase(),
+    at: String(process.env.PBMHUB_AT_NETWORK_ID || "airteltigo").trim().toLowerCase(),
+    telecel: String(process.env.PBMHUB_TELECEL_NETWORK_ID || "telecel").trim().toLowerCase(),
+  },
   providerWebhookSecret: process.env.PROVIDER_WEBHOOK_SECRET || process.env.WEBHOOK_SECRET || "",
   providerWebhookAllowedIps: String(process.env.PROVIDER_WEBHOOK_ALLOWED_IPS || "")
     .split(",")
@@ -116,7 +129,7 @@ export const CONFIG = {
 }
 
 export const SUPPORTED_PACKAGE_NETWORKS = ["mtn", "at", "telecel"]
-export const SUPPORTED_PROVIDERS = ["hubnet", "godsway", "gigshub"]
+export const SUPPORTED_PROVIDERS = ["hubnet", "godsway", "gigshub", "pbmhub"]
 export const DEFAULT_PROVIDER_ROUTING = {
   mtn: "hubnet",
   at: "hubnet",

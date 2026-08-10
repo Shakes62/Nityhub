@@ -25,6 +25,7 @@ import {
   hubnetCircuitBreaker,
   godswayCircuitBreaker,
   gigshubCircuitBreaker,
+  pbmhubCircuitBreaker,
 } from "./lib/http.js"
 import { generateReference } from "./lib/reference.js"
 import { enqueueRefund } from "./refund-queue.js"
@@ -86,6 +87,7 @@ import {
   getGigshubResponseSummary,
   classifyGigshubFailure,
   getGigshubStatusDetails,
+  getPbmhubStatusDetails,
   classifyGodswayFailure,
   getGodswayStatusDetails,
   isGodswayStatusEndpointUnavailable,
@@ -264,7 +266,13 @@ app.post("/webhook", express.json(), async (req, res) => {
         ? getGodswayStatusDetails(payload)
         : provider === "gigshub"
           ? getGigshubStatusDetails(payload)
-          : getHubnetWebhookStatusDetails(payload, normalizeInternalOrderStatus(lookup.data.status, "processing"))
+          : provider === "pbmhub"
+            ? // PBM HUB does not publish webhooks — its orders advance by
+              // polling. Parsing its envelope here anyway costs nothing and
+              // stops a hand-configured `?provider=pbmhub` delivery from being
+              // read with Hubnet's field names.
+              getPbmhubStatusDetails(payload)
+            : getHubnetWebhookStatusDetails(payload, normalizeInternalOrderStatus(lookup.data.status, "processing"))
     const providerStatus = eventStatus
       ? {
           providerStatusRaw: String(payload?.event || bodyStatus.providerStatusRaw || "").trim(),
@@ -691,6 +699,7 @@ app.get("/health", (req, res) => {
       hubnet: hubnetCircuitBreaker.getState(),
       godsway: godswayCircuitBreaker.getState(),
       gigshub: gigshubCircuitBreaker.getState(),
+      pbmhub: pbmhubCircuitBreaker.getState(),
     },
     processedTransactions: processedTransactions._store.size,
     security: {
@@ -2286,6 +2295,19 @@ app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, a
         })
       }
 
+      // PBM HUB names every failure with its own code, and the shared provider
+      // helpers already map each one to a status and a customer-safe message.
+      // Routing them through those keeps the two lists from drifting apart, so
+      // a new upstream code cannot quietly degrade into a generic 500.
+      if (errorCode === "INSUFFICIENT_PBMHUB_BALANCE" || errorCode.startsWith("PBMHUB_")) {
+        return res.status(getProviderErrorHttpStatus(errorCode)).json({
+          status: "error",
+          errorCode,
+          message: getProviderErrorMessage(error, errorCode, "Failed to process data bundle"),
+          timestamp: new Date().toISOString(),
+        })
+      }
+
       if (errorCode === "PACKAGE_PROVIDER_MAPPING_MISSING") {
         return res.status(400).json({
           status: "error",
@@ -2580,13 +2602,14 @@ app.post("/api/reset-circuit-breaker/:service", authenticateRequest, requirePriv
     hubnet: hubnetCircuitBreaker,
     godsway: godswayCircuitBreaker,
     gigshub: gigshubCircuitBreaker,
+    pbmhub: pbmhubCircuitBreaker,
   }
 
   const breaker = breakers[service]
   if (!breaker) {
     return res.status(400).json({
       status: "error",
-      message: "Invalid service. Supported services: paystack, hubnet, godsway, gigshub",
+      message: "Invalid service. Supported services: paystack, hubnet, godsway, gigshub, pbmhub",
       timestamp: new Date().toISOString(),
     })
   }
@@ -3245,6 +3268,13 @@ app.post("/api/retry-transaction/:reference", authenticateRequest, purchaseActio
     })
   }
 
+  // Mirrored out of the try block: the catch needs them to describe the order
+  // when a submission comes back indeterminate, and the originals are block
+  // scoped to the try.
+  let retryProvider = ""
+  let retryNetwork = ""
+  let retryPhone = ""
+
   try {
     const existingOrderLocation = await findOrderLocationByReference(reference, { includeOrder: true })
     const purchaseIntent = await getPurchaseIntent(reference)
@@ -3291,6 +3321,9 @@ app.post("/api/retry-transaction/:reference", authenticateRequest, purchaseActio
     }
 
     const provider = existingOrderLocation?.order?.provider || (await getActiveProviderForNetwork(safeNetwork))
+    retryProvider = provider
+    retryNetwork = safeNetwork
+    retryPhone = safePhone
     const intentClaim = await claimPurchaseIntentProcessing(reference, `retry:${INSTANCE_ID}`)
     if (purchaseIntent && !intentClaim.claimed && ["submitted", "completed", "processing"].includes(intentClaim.intent?.providerSubmissionStatus)) {
       return res.status(409).json({
@@ -3334,12 +3367,25 @@ app.post("/api/retry-transaction/:reference", authenticateRequest, purchaseActio
       })
     }
 
+    // Providers that key idempotency on our reference would replay the original
+    // outcome, and for a failed order that stored outcome IS the failure - the
+    // retry would return a cached rejection forever instead of placing a new
+    // order. Only this path may mint a fresh key, and only because an order that
+    // is merely awaiting confirmation carries retryEligible: false and was
+    // already refused above, so anything reaching here is definitively dead.
+    // Derived from the attempt count so it is stable within one retry and
+    // distinct across retries; a repeat means a replay, which is the safe way
+    // to be wrong.
+    const retryAttempt = Number(existingOrderLocation?.order?.sync?.attempts || 0) + 1
+    const providerIdempotencyKey = `${reference}:retry:${retryAttempt}`
+
     const providerResult = await getProviderAdapter(provider).purchase({
       network: safeNetwork,
       phone: safePhone,
       reference,
       catalogEntry,
       amount: paymentData.amount / 100,
+      providerIdempotencyKey,
     })
 
     const storedProviderOrderNumber = resolveStoredProviderOrderNumber(
@@ -3411,6 +3457,33 @@ app.post("/api/retry-transaction/:reference", authenticateRequest, purchaseActio
   } catch (error) {
     logger.error("Transaction retry failed", error, { reference })
     const errorCode = getErrorCode(error)
+
+    // An indeterminate submission is not a failure: the provider may have
+    // accepted the order and simply not told us in time. Marking the intent
+    // "failed" here would advertise it as retryable, and retrying an order that
+    // is already live delivers - and charges for - the bundle twice.
+    if (isIndeterminateProviderSubmissionError(error)) {
+      const pendingMessage = getIndeterminateProviderSubmissionMessage(retryProvider)
+      await upsertPurchaseIntent(reference, {
+        providerSubmissionStatus: "processing",
+        retryEligible: false,
+        errorMessage: pendingMessage,
+      }).catch(() => null)
+
+      return res.status(202).json({
+        status: "success",
+        message: pendingMessage,
+        data: {
+          reference,
+          phone: retryPhone,
+          network: retryNetwork,
+          orderStatus: "processing",
+          timestamp: Date.now(),
+        },
+        timestamp: new Date().toISOString(),
+      })
+    }
+
     const statusCode = getProviderErrorHttpStatus(errorCode)
     const message = getProviderErrorMessage(error, errorCode, "Transaction retry failed")
     await upsertPurchaseIntent(reference, {

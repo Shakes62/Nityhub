@@ -123,6 +123,10 @@ export const PROVIDER_MAPPING_FIELDS: Record<string, ProviderMappingField[]> = {
     { key: "capacity", label: "Capacity (GB)", hint: "Bundle size in GB, e.g. 1 or 1.5" },
   ],
   gigshub: [{ key: "packageId", label: "Package ID", hint: "The GiGSHUB plan id for this bundle" }],
+  pbmhub: [
+    { key: "network", label: "Network id", hint: "PBM HUB network id — mtnup2u, airteltigo or telecel" },
+    { key: "size", label: "Size", hint: "Exactly as PBM HUB lists it, e.g. 1GB or 500MB" },
+  ],
 };
 
 /** GET /api/admin/packages/:network */
@@ -195,7 +199,7 @@ export const ADMIN_NETWORKS = ["mtn", "at", "telecel"] as const;
 export type AdminNetwork = (typeof ADMIN_NETWORKS)[number];
 
 /** Data providers the backend can route to. */
-export const ADMIN_PROVIDERS = ["hubnet", "godsway", "gigshub"] as const;
+export const ADMIN_PROVIDERS = ["hubnet", "godsway", "gigshub", "pbmhub"] as const;
 export type AdminProvider = (typeof ADMIN_PROVIDERS)[number];
 
 /** Canonical internal order statuses (from domain.normalizeInternalOrderStatus). */

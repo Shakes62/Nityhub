@@ -38,6 +38,7 @@ import {
   hubnetCircuitBreaker,
   godswayCircuitBreaker,
   gigshubCircuitBreaker,
+  pbmhubCircuitBreaker,
 } from "./lib/http.js"
 import { generateReference } from "./lib/reference.js"
 import {
@@ -69,6 +70,16 @@ import {
   getHubnetWebhookStatusDetails,
   isHubnetTransactionNotFoundResponse,
 } from "./lib/hubnet.js"
+import {
+  formatPbmhubSizeFromVolume,
+  extractPbmhubErrorCode,
+  getPbmhubResponseSummary,
+  extractPbmhubOrderReference,
+  isPbmhubDuplicateReplay,
+  isPbmhubOrderNotFound,
+  classifyPbmhubFailure,
+  getPbmhubStatusDetails,
+} from "./lib/pbmhub.js"
 import {
   normalizeInternalOrderStatus,
   isTerminalOrderStatus,
@@ -265,6 +276,51 @@ async function checkGigshubBalance() {
 
   if (!data?.success) {
     const failure = classifyGigshubFailure(data)
+    throw createAppError(failure.code, {
+      providerMessage: failure.message,
+      providerResponse: data,
+    })
+  }
+
+  return data
+}
+
+/**
+ * PBM HUB wallet balance.
+ *
+ * `balance` is what is spendable now; `held_balance` is already reserved by
+ * in-flight orders, so the two must not be added together when deciding whether
+ * a purchase can go through.
+ */
+async function checkPbmhubBalance() {
+  const baseUrl = String(CONFIG.pbmhubBaseUrl || "").replace(/\/$/, "")
+  let data
+  try {
+    data = await fetchWithRetry(
+      `${baseUrl}/api/v1/balance`,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${CONFIG.pbmhubApiKey}`,
+          "Content-Type": "application/json",
+        },
+      },
+      {
+        circuitBreaker: pbmhubCircuitBreaker,
+        timeout: 8000,
+      },
+    )
+  } catch (error) {
+    const failure = classifyPbmhubFailure(error?.responseData, error?.message, error?.statusCode)
+    throw createAppError(failure.code, {
+      providerMessage: failure.message,
+      providerResponse: error?.responseData || null,
+      statusCode: error?.statusCode || null,
+    })
+  }
+
+  if (!data?.success) {
+    const failure = classifyPbmhubFailure(data)
     throw createAppError(failure.code, {
       providerMessage: failure.message,
       providerResponse: data,
@@ -637,6 +693,17 @@ function sanitizeProviderMeta(provider, value = {}) {
     return {
       reference: source.reference || source?.order?.reference || null,
       status: source.status || source?.order?.status || null,
+    }
+  }
+
+  if (provider === "pbmhub") {
+    const data = source?.data && typeof source.data === "object" ? source.data : {}
+    return {
+      reference: data.reference || source.reference || null,
+      purchaseId: data.purchase_id || source.purchase_id || null,
+      orderId: data.order_id || source.order_id || null,
+      status: data.status || source.status || null,
+      message: String(source.message || "").trim() || null,
     }
   }
 
@@ -1162,6 +1229,14 @@ function assertProviderConfigured(provider, context = "runtime") {
       provider: "gigshub",
       context,
       providerMessage: "GiGSHUB is routed for one or more networks, but GIGSHUB_API_KEY is missing.",
+    })
+  }
+
+  if (safeProvider === "pbmhub" && !CONFIG.pbmhubApiKey) {
+    throw createAppError("PROVIDER_CONFIGURATION_MISSING", {
+      provider: "pbmhub",
+      context,
+      providerMessage: "PBM HUB is routed for one or more networks, but PBMHUB_API_KEY is missing.",
     })
   }
 }
@@ -3156,6 +3231,7 @@ export {
   resolveGodswayWebhookUrl,
   resolveGigshubWebhookUrl,
   checkGigshubBalance,
+  checkPbmhubBalance,
   initializePaystackPayment,
   verifyPaystackPayment,
   checkHubnetBalance,
@@ -3185,6 +3261,14 @@ export {
   getGigshubResponseSummary,
   classifyGigshubFailure,
   getGigshubStatusDetails,
+  formatPbmhubSizeFromVolume,
+  extractPbmhubErrorCode,
+  getPbmhubResponseSummary,
+  extractPbmhubOrderReference,
+  isPbmhubDuplicateReplay,
+  isPbmhubOrderNotFound,
+  classifyPbmhubFailure,
+  getPbmhubStatusDetails,
   classifyGodswayFailure,
   getGodswayStatusDetails,
   isGodswayStatusEndpointUnavailable,

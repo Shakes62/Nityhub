@@ -18,11 +18,16 @@ import { admin, db } from "./firebase.js"
 import { logger } from "./logger.js"
 import { createAppError, getErrorCode, parseJsonText } from "./lib/errors.js"
 import {
+  isIndeterminateProviderSubmissionError,
+  getIndeterminateProviderSubmissionMessage,
+} from "./lib/provider-failure.js"
+import {
   fetchWithRetry,
   paystackCircuitBreaker,
   hubnetCircuitBreaker,
   godswayCircuitBreaker,
   gigshubCircuitBreaker,
+  pbmhubCircuitBreaker,
 } from "./lib/http.js"
 import { generateReference } from "./lib/reference.js"
 import {
@@ -56,6 +61,7 @@ import {
   resolveGodswayWebhookUrl,
   resolveGigshubWebhookUrl,
   checkGigshubBalance,
+  checkPbmhubBalance,
   initializePaystackPayment,
   verifyPaystackPayment,
   checkHubnetBalance,
@@ -82,6 +88,11 @@ import {
   getGigshubResponseSummary,
   classifyGigshubFailure,
   getGigshubStatusDetails,
+  extractPbmhubOrderReference,
+  isPbmhubDuplicateReplay,
+  isPbmhubOrderNotFound,
+  classifyPbmhubFailure,
+  getPbmhubStatusDetails,
   classifyGodswayFailure,
   getGodswayStatusDetails,
   isGodswayStatusEndpointUnavailable,
@@ -644,6 +655,282 @@ async function getGigshubOrderStatus(gigshubReference) {
   }
 }
 
+/**
+ * Submit one order to PBM HUB.
+ *
+ * Two things make this different from the other providers:
+ *
+ * 1. Idempotency is server-side and keyed on a header. Our own reference is
+ *    already unique per order, so it doubles as X-Idempotency-Key: any replay
+ *    returns the original outcome flagged "Duplicate request - no new charge"
+ *    rather than charging the wallet twice.
+ * 2. A network timeout comes back as 202 with the debit HELD, not reversed -
+ *    the order may already be live upstream. That is the one 2xx we must never
+ *    read as "nothing happened". When the body still carries their reference we
+ *    accept the order and let the reconciler poll it to a terminal state; when
+ *    it does not, we raise an indeterminate error so the caller keeps the debit
+ *    and parks the order for review instead of refunding a bundle that may land.
+ */
+async function processPbmhubTransaction(payload) {
+  const network = String(payload.network || "").trim().toLowerCase()
+  const size = String(payload.size || "").trim()
+  const recipient = sanitizePhoneNumber(payload.recipient)
+  const reference = String(payload.reference || "").trim()
+  // Defaults to our reference, which is unique per order and is what makes an
+  // ordinary retry of the SAME attempt free. A caller that has established the
+  // original dispatch is dead overrides it: replaying the original key would
+  // return PBM HUB's stored outcome, and for a failed order that outcome is the
+  // failure itself, so the order would never be re-placed.
+  const idempotencyKey = String(payload.providerIdempotencyKey || "").trim() || reference
+  // Size alone is not unique across networks ("1GB" exists on all three), so the
+  // network is part of the key - otherwise an MTN and a Telecel 1GB to the same
+  // recipient would look like a repeat of each other.
+  const duplicateKey = `${recipient}_${network}_${size}_pbmhub`
+
+  if (processedTransactions.has(reference)) {
+    const metadata = processedTransactions.get(reference)
+    if (metadata && metadata.pbmhubResponse) {
+      logger.info("PBM HUB transaction already processed", { reference })
+      return metadata.pbmhubResponse
+    }
+    return {
+      success: true,
+      message: "Already processed",
+      data: {
+        // Deliberately omitted when we never learned PBM HUB's reference: ours
+        // is not a valid lookup upstream, so echoing it here would store an
+        // order number that 404s on every poll instead of one that is simply
+        // absent, which the status adapter already handles by parking the order.
+        ...(metadata?.providerReference ? { reference: metadata.providerReference } : {}),
+        status: "PROCESSING",
+      },
+    }
+  }
+
+  const duplicateCheck = checkDuplicateAttempts(duplicateKey, "phone_transaction")
+  if (duplicateCheck.isSuspicious) {
+    logger.error("Suspicious duplicate attempts detected for PBM HUB", {
+      reference,
+      phone: recipient,
+      network,
+      size,
+      attempts: duplicateCheck.count,
+    })
+    throw new Error("SUSPICIOUS_ACTIVITY_DETECTED")
+  }
+
+  const phoneLockAcquired = acquirePhoneTransactionLock(recipient, `${size}_pbmhub`, network)
+  if (!phoneLockAcquired) {
+    logger.warn("PBM HUB phone transaction lock conflict", { reference, phone: recipient, network, size })
+    recordDuplicateAttempt(duplicateKey, "phone_transaction")
+    throw new Error("DUPLICATE_TRANSACTION_ATTEMPT")
+  }
+
+  try {
+    const baseUrl = String(CONFIG.pbmhubBaseUrl || "").replace(/\/$/, "")
+    const apiUrl = `${baseUrl}/api/v1/purchase`
+    const requestBody = {
+      network,
+      size,
+      beneficiary_phone: recipient,
+      idempotency_key: idempotencyKey,
+    }
+
+    // The key is logged because a mis-named context field would silently fall
+    // back to the reference and make every retry a replay - the failure mode is
+    // invisible otherwise, since nothing throws.
+    logger.info("Processing PBM HUB transaction", {
+      reference,
+      apiUrl,
+      network,
+      size,
+      recipient,
+      idempotencyKey,
+      freshKey: idempotencyKey !== reference,
+    })
+
+    let data
+    let statusCode = 0
+    try {
+      const result = await fetchWithRetry(
+        apiUrl,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${CONFIG.pbmhubApiKey}`,
+            "X-Idempotency-Key": idempotencyKey,
+          },
+          body: JSON.stringify(requestBody),
+        },
+        {
+          circuitBreaker: pbmhubCircuitBreaker,
+          timeout: 15000,
+          maxRetries: CONFIG.providerSubmissionMaxRetries,
+          includeResponseMeta: true,
+        },
+      )
+      data = result.data
+      statusCode = result.statusCode
+    } catch (error) {
+      const failure = classifyPbmhubFailure(error?.responseData, error?.message, error?.statusCode)
+      logger.error("PBM HUB request failed", error, {
+        reference,
+        statusCode: error?.statusCode || null,
+        providerMessage: failure.message,
+        response: error?.responseData || null,
+      })
+      throw createAppError(failure.code, {
+        providerMessage: failure.message,
+        providerResponse: error?.responseData || null,
+        statusCode: error?.statusCode || null,
+        upstreamCode: error?.code || null,
+      })
+    }
+
+    const providerReference = extractPbmhubOrderReference(data)
+
+    if (statusCode === 202) {
+      if (!providerReference) {
+        logger.error("PBM HUB held a debit without returning a reference", new Error("PBMHUB_SUBMISSION_PENDING"), {
+          reference,
+          response: data,
+        })
+        throw createAppError("PBMHUB_SUBMISSION_PENDING", {
+          providerMessage:
+            "PBM HUB timed out and held the debit without returning an order reference. Do not retry; this order is pending review.",
+          providerResponse: data,
+          statusCode,
+        })
+      }
+
+      logger.warn("PBM HUB accepted the order on a held debit (202)", {
+        reference,
+        pbmhubReference: providerReference,
+      })
+    } else if (!data?.success) {
+      const failure = classifyPbmhubFailure(data, data?.message, statusCode)
+      logger.error("PBM HUB transaction failed", new Error(failure.message), {
+        reference,
+        code: failure.code,
+        response: data,
+      })
+      throw createAppError(failure.code, {
+        providerMessage: failure.message,
+        providerResponse: data,
+        statusCode,
+      })
+    }
+
+    if (!providerReference) {
+      // Their contract says /purchase always returns one, and without it the
+      // order can never be polled. Keep the order (the wallet was charged) but
+      // make the reason it will stall obvious in the logs.
+      logger.error("PBM HUB returned no order reference", new Error("PBMHUB_REFERENCE_MISSING"), {
+        reference,
+        response: data,
+      })
+    }
+
+    processedTransactions.add(reference, {
+      provider: "pbmhub",
+      phone: recipient,
+      network,
+      size,
+      providerReference: providerReference || null,
+      pbmhubResponse: data,
+      processedAt: new Date().toISOString(),
+    })
+
+    logger.info("PBM HUB transaction successful", {
+      reference,
+      pbmhubReference: providerReference || null,
+      status: data?.data?.status || null,
+      duplicateReplay: isPbmhubDuplicateReplay(data),
+    })
+
+    return data
+  } finally {
+    releasePhoneTransactionLock(recipient, `${size}_pbmhub`, network)
+  }
+}
+
+async function getPbmhubOrderStatus(pbmhubReference) {
+  const providerRef = String(pbmhubReference || "").trim()
+  if (!providerRef) {
+    throw createAppError("PBMHUB_REFERENCE_MISSING", {
+      providerMessage: "PBM HUB status check requires the provider order reference.",
+    })
+  }
+
+  const baseUrl = String(CONFIG.pbmhubBaseUrl || "").replace(/\/$/, "")
+  const apiUrl = `${baseUrl}/api/v1/orders/${encodeURIComponent(providerRef)}`
+
+  let data
+  try {
+    data = await fetchWithRetry(
+      apiUrl,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${CONFIG.pbmhubApiKey}`,
+          "Content-Type": "application/json",
+        },
+      },
+      {
+        circuitBreaker: pbmhubCircuitBreaker,
+        timeout: 12000,
+        maxRetries: 1,
+      },
+    )
+  } catch (error) {
+    if (isPbmhubOrderNotFound(error)) {
+      // PBM HUB has not indexed the reference yet. Skipping keeps the order open
+      // for the next sweep; treating it as a failure would wrongly mark a live
+      // order failed and trigger a refund.
+      return {
+        supported: false,
+        skippedReason: "PBM HUB has no record of this reference yet",
+      }
+    }
+
+    const failure = classifyPbmhubFailure(error?.responseData, error?.message, error?.statusCode)
+    throw createAppError(failure.code, {
+      providerMessage: failure.message,
+      providerResponse: error?.responseData || null,
+      statusCode: error?.statusCode || null,
+    })
+  }
+
+  if (!data?.success) {
+    if (isPbmhubOrderNotFound({ responseData: data })) {
+      return {
+        supported: false,
+        skippedReason: "PBM HUB has no record of this reference yet",
+      }
+    }
+
+    const failure = classifyPbmhubFailure(data, data?.message)
+    throw createAppError(failure.code, {
+      providerMessage: failure.message,
+      providerResponse: data,
+    })
+  }
+
+  const statusDetails = getPbmhubStatusDetails(data)
+  return {
+    supported: true,
+    provider: "pbmhub",
+    providerReference: providerRef,
+    providerOrderNumber: providerRef,
+    providerStatusRaw: statusDetails.providerStatusRaw,
+    providerStatusDescription: statusDetails.providerStatusDescription,
+    status: statusDetails.normalizedStatus,
+    providerMeta: sanitizeProviderMeta("pbmhub", data),
+    providerResponse: data,
+  }
+}
+
 function createProviderPurchaseMetadata(provider, response, reference, fallbackNetwork = "") {
   const now = Date.now()
 
@@ -681,6 +968,28 @@ function createProviderPurchaseMetadata(provider, response, reference, fallbackN
       providerMeta: sanitizeProviderMeta(provider, response),
       providerResponse: response,
       status: "accepted",
+      statusSource: "provider_purchase",
+      statusUpdatedAt: now,
+      updatedAt: now,
+    }
+  }
+
+  if (provider === "pbmhub") {
+    const statusDetails = getPbmhubStatusDetails(response)
+    // Their reference, not ours - it is the only identifier /orders/:reference
+    // resolves, so storing anything else here makes the order unpollable.
+    const providerOrderNumber = extractPbmhubOrderReference(response) || null
+    return {
+      provider,
+      providerReference: providerOrderNumber || reference,
+      providerOrderNumber,
+      providerStatusRaw: statusDetails.providerStatusRaw || "PROCESSING",
+      providerStatusDescription: statusDetails.providerStatusDescription || "Order accepted by PBM HUB",
+      providerMeta: sanitizeProviderMeta(provider, response),
+      providerResponse: response,
+      // Trust the status PBM HUB reported at submit time (PROCESSING on a fresh
+      // order, but a duplicate replay can come back already DELIVERED).
+      status: statusDetails.normalizedStatus || "accepted",
       statusSource: "provider_purchase",
       statusUpdatedAt: now,
       updatedAt: now,
@@ -1065,6 +1374,63 @@ const providerAdapters = {
       }
     },
   },
+  pbmhub: {
+    async purchase({ network, phone, reference, catalogEntry, providerIdempotencyKey }) {
+      assertProviderConfigured("pbmhub", "purchase")
+      const mapping = getPackageProviderMapping(network, "pbmhub", catalogEntry)
+      const response = await processPbmhubTransaction({
+        network: mapping.network,
+        size: mapping.size,
+        recipient: phone,
+        reference,
+        providerIdempotencyKey,
+      })
+      return createProviderPurchaseMetadata("pbmhub", response, reference, network)
+    },
+    async getOrderStatus(order) {
+      assertProviderConfigured("pbmhub", "status")
+      const providerOrderNumber = String(order.providerOrderNumber || "").trim()
+      if (!providerOrderNumber) {
+        // Unlike CK-Godsway there is no fallback to our own reference: PBM HUB
+        // only resolves references it issued, so ours would 404 on every poll.
+        return {
+          supported: false,
+          skippedReason: "PBM HUB order reference not available - cannot query status",
+        }
+      }
+      return await getPbmhubOrderStatus(providerOrderNumber)
+    },
+    async health() {
+      let balance = null
+      let balanceError = ""
+
+      try {
+        assertProviderConfigured("pbmhub", "health")
+      } catch (error) {
+        return {
+          provider: "pbmhub",
+          supportsBalanceCheck: true,
+          breaker: pbmhubCircuitBreaker.getState(),
+          balance: null,
+          balanceError: error?.providerMessage || error?.message || "PBM HUB is not configured",
+        }
+      }
+
+      try {
+        balance = await checkPbmhubBalance()
+      } catch (error) {
+        balanceError = error?.providerMessage || error?.message || "Failed to load PBM HUB balance"
+      }
+
+      return {
+        provider: "pbmhub",
+        supportsBalanceCheck: true,
+        breaker: pbmhubCircuitBreaker.getState(),
+        balance,
+        balanceError,
+      }
+    },
+  },
 }
 
 function getProviderAdapter(provider) {
@@ -1127,14 +1493,16 @@ async function getOrderSyncHealthSummary() {
 }
 
 async function getProviderHealthSnapshot() {
-  const [routing, sync, syncStateSnapshot, hubnetHealth, godswayHealth, gigshubHealth] = await Promise.all([
-    getProviderRoutingConfig(),
-    getOrderSyncHealthSummary(),
-    db.ref(ORDER_SYNC_STATE_PATH).once("value"),
-    providerAdapters.hubnet.health(),
-    providerAdapters.godsway.health(),
-    providerAdapters.gigshub.health(),
-  ])
+  const [routing, sync, syncStateSnapshot, hubnetHealth, godswayHealth, gigshubHealth, pbmhubHealth] =
+    await Promise.all([
+      getProviderRoutingConfig(),
+      getOrderSyncHealthSummary(),
+      db.ref(ORDER_SYNC_STATE_PATH).once("value"),
+      providerAdapters.hubnet.health(),
+      providerAdapters.godsway.health(),
+      providerAdapters.gigshub.health(),
+      providerAdapters.pbmhub.health(),
+    ])
 
   return {
     routing,
@@ -1144,6 +1512,7 @@ async function getProviderHealthSnapshot() {
       hubnet: hubnetHealth,
       godsway: godswayHealth,
       gigshub: gigshubHealth,
+      pbmhub: pbmhubHealth,
     },
     timestamp: new Date().toISOString(),
   }
@@ -1154,15 +1523,38 @@ function getProviderErrorHttpStatus(errorCode) {
     return 409
   }
 
-  if (errorCode === "HUBNET_RATE_LIMITED" || errorCode === "GODSWAY_RATE_LIMITED" || errorCode === "GIGSHUB_RATE_LIMITED") {
+  if (
+    errorCode === "HUBNET_RATE_LIMITED" ||
+    errorCode === "GODSWAY_RATE_LIMITED" ||
+    errorCode === "GIGSHUB_RATE_LIMITED" ||
+    errorCode === "PBMHUB_RATE_LIMITED" ||
+    errorCode === "PBMHUB_DUPLICATE_WINDOW"
+  ) {
     return 429
   }
 
-  if (errorCode === "HUBNET_AUTH_FAILED" || errorCode === "GODSWAY_AUTH_FAILED" || errorCode === "GIGSHUB_AUTH_FAILED") {
+  if (
+    errorCode === "HUBNET_AUTH_FAILED" ||
+    errorCode === "GODSWAY_AUTH_FAILED" ||
+    errorCode === "GIGSHUB_AUTH_FAILED" ||
+    errorCode === "PBMHUB_AUTH_FAILED"
+  ) {
     return 502
   }
 
-  if (errorCode === "INSUFFICIENT_HUBNET_BALANCE" || errorCode === "INSUFFICIENT_GODSWAY_BALANCE" || errorCode === "INSUFFICIENT_GIGSHUB_BALANCE") {
+  if (
+    errorCode === "INSUFFICIENT_HUBNET_BALANCE" ||
+    errorCode === "INSUFFICIENT_GODSWAY_BALANCE" ||
+    errorCode === "INSUFFICIENT_GIGSHUB_BALANCE" ||
+    errorCode === "INSUFFICIENT_PBMHUB_BALANCE" ||
+    errorCode === "PBMHUB_WALLET_FROZEN" ||
+    errorCode === "PBMHUB_NETWORK_UNAVAILABLE" ||
+    errorCode === "PBMHUB_PURCHASE_FAILED" ||
+    // Only reachable if a caller treats an indeterminate submission as a plain
+    // error. Callers that know about it answer 202 and keep the debit; see
+    // isIndeterminateProviderSubmissionError.
+    errorCode === "PBMHUB_SUBMISSION_PENDING"
+  ) {
     return 503
   }
 
@@ -1174,11 +1566,15 @@ function getProviderErrorHttpStatus(errorCode) {
     return 500
   }
 
-  if (errorCode === "GODSWAY_REFERENCE_MISSING" || errorCode === "GIGSHUB_REFERENCE_MISSING") {
+  if (
+    errorCode === "GODSWAY_REFERENCE_MISSING" ||
+    errorCode === "GIGSHUB_REFERENCE_MISSING" ||
+    errorCode === "PBMHUB_REFERENCE_MISSING"
+  ) {
     return 400
   }
 
-  if (errorCode === "GIGSHUB_INVALID_PACKAGE") {
+  if (errorCode === "GIGSHUB_INVALID_PACKAGE" || errorCode === "PBMHUB_INVALID_PACKAGE") {
     return 400
   }
 
@@ -1214,7 +1610,40 @@ function getProviderErrorMessage(error, errorCode, fallback = "Provider request 
     return "GiGSHUB API rate limit reached. Please try again shortly."
   }
 
-  if (errorCode === "INSUFFICIENT_HUBNET_BALANCE" || errorCode === "INSUFFICIENT_GODSWAY_BALANCE" || errorCode === "INSUFFICIENT_GIGSHUB_BALANCE") {
+  if (errorCode === "PBMHUB_AUTH_FAILED") {
+    return "PBM HUB API authentication failed. Update PBMHUB_API_KEY."
+  }
+
+  if (errorCode === "PBMHUB_RATE_LIMITED") {
+    return "PBM HUB API rate limit reached. Please try again shortly."
+  }
+
+  if (errorCode === "PBMHUB_DUPLICATE_WINDOW") {
+    return "PBM HUB rejected a repeat purchase for this recipient. Please wait before retrying."
+  }
+
+  if (errorCode === "PBMHUB_NETWORK_UNAVAILABLE") {
+    return "PBM HUB has temporarily disabled this network. Try again later or reroute the network."
+  }
+
+  if (errorCode === "PBMHUB_WALLET_FROZEN") {
+    return "PBM HUB has frozen the account wallet. Contact PBM HUB support."
+  }
+
+  if (errorCode === "PBMHUB_PURCHASE_FAILED") {
+    return "PBM HUB's upstream provider failed. Please try again shortly."
+  }
+
+  if (errorCode === "PBMHUB_INVALID_PACKAGE") {
+    return "PBM HUB rejected the network or size. Check the package mapping."
+  }
+
+  if (
+    errorCode === "INSUFFICIENT_HUBNET_BALANCE" ||
+    errorCode === "INSUFFICIENT_GODSWAY_BALANCE" ||
+    errorCode === "INSUFFICIENT_GIGSHUB_BALANCE" ||
+    errorCode === "INSUFFICIENT_PBMHUB_BALANCE"
+  ) {
     return "Service provider has insufficient balance"
   }
 
@@ -1222,7 +1651,11 @@ function getProviderErrorMessage(error, errorCode, fallback = "Provider request 
     return "Selected package is not configured for the active provider route."
   }
 
-  if (errorCode === "GODSWAY_REFERENCE_MISSING" || errorCode === "GIGSHUB_REFERENCE_MISSING") {
+  if (
+    errorCode === "GODSWAY_REFERENCE_MISSING" ||
+    errorCode === "GIGSHUB_REFERENCE_MISSING" ||
+    errorCode === "PBMHUB_REFERENCE_MISSING"
+  ) {
     return "Provider status check requires the provider order reference."
   }
 
@@ -1233,35 +1666,9 @@ function getProviderErrorMessage(error, errorCode, fallback = "Provider request 
   return fallback
 }
 
-function isIndeterminateProviderSubmissionError(error) {
-  const errorCode = getErrorCode(error)
-  const upstreamCode = String(error?.upstreamCode || "").trim().toUpperCase()
-  const statusCode = Number(error?.statusCode || 0)
-
-  if (["REQUEST_TIMEOUT", "NETWORK_ERROR"].includes(upstreamCode)) {
-    return true
-  }
-
-  if (["HUBNET_API_ERROR", "GODSWAY_API_ERROR", "GIGSHUB_API_ERROR"].includes(errorCode) && (!statusCode || statusCode >= 500)) {
-    return true
-  }
-
-  return false
-}
-
-function getIndeterminateProviderSubmissionMessage(provider = "") {
-  const normalized = normalizeProvider(provider)
-  const providerLabel =
-    normalized === "godsway"
-      ? "CK-Godsway"
-      : normalized === "hubnet"
-        ? "Hubnet"
-        : normalized === "gigshub"
-          ? "GiGSHUB"
-          : "provider"
-
-  return `${providerLabel} did not return a final confirmation. Do not retry this purchase yet; it is pending review.`
-}
+// isIndeterminateProviderSubmissionError / getIndeterminateProviderSubmissionMessage
+// now live in ./lib/provider-failure.js (imported at the top) and are
+// re-exported below.
 
 let reconciliationInFlight = false
 
@@ -1600,6 +2007,8 @@ export {
   processGodswayTransaction,
   processGigshubTransaction,
   getGigshubOrderStatus,
+  processPbmhubTransaction,
+  getPbmhubOrderStatus,
   createProviderPurchaseMetadata,
   getGodswayOrderStatus,
   getHubnetOrderStatus,
