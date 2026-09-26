@@ -14,12 +14,37 @@
 import { toMoneyNumber } from "./money.js"
 
 /**
+ * The per-provider price overrides for a catalog entry, if any.
+ *
+ * Shape: `{ hubnet: { userPrice, agentPrice }, pbmhub: { ... } }`. A provider
+ * with no entry, or with a non-positive price, falls back to the package's own
+ * price - so adding a provider never silently zero-prices a bundle.
+ */
+function readProviderPricing(catalogEntry = {}, provider = "") {
+  const key = String(provider || "").trim().toLowerCase()
+  if (!key) {
+    return null
+  }
+
+  const pricing = catalogEntry?.providerPricing
+  if (!pricing || typeof pricing !== "object" || Array.isArray(pricing)) {
+    return null
+  }
+
+  const entry = pricing[key]
+  return entry && typeof entry === "object" && !Array.isArray(entry) ? entry : null
+}
+
+/**
  * The regular (non-agent) price for a catalog entry.
  *
- * Falls back through the legacy `price` field that older catalog rows used.
+ * When a provider is named, that provider's own price wins. Falls back through
+ * the package price and then the legacy `price` field that older catalog rows
+ * used, so a package priced before per-provider rates existed still sells.
  */
-export function resolveUserPrice(catalogEntry = {}) {
-  const candidates = [catalogEntry?.userPrice, catalogEntry?.price]
+export function resolveUserPrice(catalogEntry = {}, { provider = "" } = {}) {
+  const providerPricing = readProviderPricing(catalogEntry, provider)
+  const candidates = [providerPricing?.userPrice, catalogEntry?.userPrice, catalogEntry?.price]
   for (const candidate of candidates) {
     const parsed = toMoneyNumber(candidate, 0)
     if (parsed > 0) {
@@ -38,10 +63,19 @@ export function resolveUserPrice(catalogEntry = {}) {
  * to 0: the admin catalog editor sends `Number("") || 0` for an untouched
  * field, and treating that literally handed agents free data.
  */
-export function resolveAgentPrice(catalogEntry = {}) {
-  const userPrice = resolveUserPrice(catalogEntry)
-  const agentPrice = toMoneyNumber(catalogEntry?.agentPrice, 0)
-  return agentPrice > 0 ? agentPrice : userPrice
+export function resolveAgentPrice(catalogEntry = {}, { provider = "" } = {}) {
+  const userPrice = resolveUserPrice(catalogEntry, { provider })
+  const providerPricing = readProviderPricing(catalogEntry, provider)
+  // The provider's own wholesale rate first, then the package's. A blank
+  // provider rate means "no separate rate for this provider", not "free".
+  for (const candidate of [providerPricing?.agentPrice, catalogEntry?.agentPrice]) {
+    const parsed = toMoneyNumber(candidate, 0)
+    if (parsed > 0) {
+      return parsed
+    }
+  }
+
+  return userPrice
 }
 
 /**
@@ -52,6 +86,25 @@ export function resolveAgentPrice(catalogEntry = {}) {
  * a missing or malformed role can only ever over-charge relative to wholesale -
  * never hand out an unearned discount.
  */
-export function resolveEffectivePackagePrice(catalogEntry = {}, { agentPricing = false } = {}) {
-  return agentPricing === true ? resolveAgentPrice(catalogEntry) : resolveUserPrice(catalogEntry)
+export function resolveEffectivePackagePrice(catalogEntry = {}, { agentPricing = false, provider = "" } = {}) {
+  return agentPricing === true
+    ? resolveAgentPrice(catalogEntry, { provider })
+    : resolveUserPrice(catalogEntry, { provider })
+}
+
+/**
+ * Both tiers for one provider, for the admin editor.
+ *
+ * Returns what that provider would actually charge, resolved through the same
+ * fallbacks the till uses - so the number an admin sees is the number a customer
+ * would be charged, rather than a raw (possibly blank) override.
+ */
+export function resolveProviderPricePair(catalogEntry = {}, provider = "") {
+  return {
+    provider: String(provider || "").trim().toLowerCase(),
+    userPrice: resolveUserPrice(catalogEntry, { provider }),
+    agentPrice: resolveAgentPrice(catalogEntry, { provider }),
+    /** False when this provider simply inherits the package price. */
+    overridden: Boolean(readProviderPricing(catalogEntry, provider)),
+  }
 }

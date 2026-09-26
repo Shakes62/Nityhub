@@ -33,6 +33,13 @@ import {
   isCompleteProviderMapping,
 } from "./lib/provider-mapping.js"
 import {
+  CANDIDATE_SKIP_REASON,
+  buildProviderCandidates,
+  hasCandidateAfter,
+  listRoutableProviders,
+  normalizeProviderRouteList,
+} from "./lib/provider-routing.js"
+import {
   fetchWithRetry,
   paystackCircuitBreaker,
   hubnetCircuitBreaker,
@@ -49,11 +56,19 @@ import {
   sanitizeMutationId,
   trimWalletMutationHistory,
 } from "./lib/money.js"
-import { computeWalletMutation, WALLET_MUTATION } from "./lib/wallet-core.js"
+import {
+  computeWalletMutation,
+  computeWalletHoldMutation,
+  getAvailableWalletBalance,
+  getHeldWalletBalance,
+  WALLET_HOLD_OPERATION,
+  WALLET_MUTATION,
+} from "./lib/wallet-core.js"
 import {
   resolveUserPrice,
   resolveAgentPrice,
   resolveEffectivePackagePrice,
+  resolveProviderPricePair,
 } from "./lib/pricing.js"
 import {
   extractGodswayOrderNumber,
@@ -723,6 +738,43 @@ function defaultPackageLabel(volume) {
   return volume % 1000 === 0 ? `${volume / 1000}GB` : `${volume}MB`
 }
 
+/**
+ * Per-provider price overrides, keyed by canonical provider.
+ *
+ * Only positive amounts are stored. A blank or zero field means "this provider
+ * has no separate rate" and is dropped so it falls back to the package price -
+ * persisting the 0 the admin editor sends for an untouched field would sell the
+ * bundle for nothing, which is exactly the bug the agent-price fallback exists
+ * to prevent.
+ */
+function normalizeProviderPricing(raw) {
+  const source = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}
+  const normalized = {}
+
+  for (const provider of SUPPORTED_PROVIDERS) {
+    const entry = source[provider]
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      continue
+    }
+
+    const userPrice = toMoneyNumber(entry.userPrice, 0)
+    const agentPrice = toMoneyNumber(entry.agentPrice, 0)
+    const priced = {}
+    if (userPrice > 0) {
+      priced.userPrice = userPrice
+    }
+    if (agentPrice > 0) {
+      priced.agentPrice = agentPrice
+    }
+
+    if (Object.keys(priced).length) {
+      normalized[provider] = priced
+    }
+  }
+
+  return normalized
+}
+
 function normalizeCatalogEntry(raw, fallbackId = "", network = "") {
   const volume = Number(raw?.volume || 0)
   if (!Number.isFinite(volume) || volume <= 0) {
@@ -735,6 +787,7 @@ function normalizeCatalogEntry(raw, fallbackId = "", network = "") {
   // data while the UI still displayed the regular price.
   const userPrice = resolveUserPrice(raw)
   const agentPrice = resolveAgentPrice(raw)
+  const providerPricing = normalizeProviderPricing(raw?.providerPricing)
   const label = String(raw?.label || defaultPackageLabel(volume)).trim()
   const idBase = raw?.id || fallbackId || `${volume}-${Math.round(userPrice * 100)}`
 
@@ -744,6 +797,7 @@ function normalizeCatalogEntry(raw, fallbackId = "", network = "") {
     volume,
     userPrice,
     agentPrice,
+    providerPricing,
     enabled: raw?.enabled !== false,
     sortOrder: Number(raw?.sortOrder || volume),
     updatedAt: toTimestampValue(raw?.updatedAt, Date.now()) || Date.now(),
@@ -778,9 +832,10 @@ function getCatalogRef(network) {
  * It also keeps agent status invisible: the response looks identical in shape
  * for every caller, so nothing in the UI can reveal that a discount applied.
  */
-function toPublicCatalogEntry(entry, { agentPricing = false } = {}) {
+function toPublicCatalogEntry(entry, { agentPricing = false, provider = "" } = {}) {
   const {
     providerMappings,
+    providerPricing,
     updatedBy,
     userPrice,
     agentPrice,
@@ -789,7 +844,10 @@ function toPublicCatalogEntry(entry, { agentPricing = false } = {}) {
 
   return {
     ...publicEntry,
-    price: resolveEffectivePackagePrice(entry, { agentPricing }),
+    // Priced against the PRIMARY provider for the network. Failover may hand
+    // the order to a costlier provider, but the customer pays what they were
+    // quoted — the difference comes out of margin, not out of the buyer.
+    price: resolveEffectivePackagePrice(entry, { agentPricing, provider }),
   }
 }
 
@@ -797,15 +855,29 @@ function getProviderRoutingRef() {
   return db.ref("settings/providers/routing")
 }
 
+/**
+ * The routing map, as an ordered provider list per network.
+ *
+ * Position 0 is the primary: it is what the shop quotes and what serves the
+ * order when it can. The rest are failover, tried in order and only after a
+ * definitive refusal.
+ */
 function normalizeProviderRouting(raw = {}) {
   const source = raw && typeof raw === "object" ? raw : {}
   const normalized = {}
 
   for (const network of SUPPORTED_PACKAGE_NETWORKS) {
-    normalized[network] = normalizeProviderRoutingValue(network, source?.[network])
+    normalized[network] = normalizeProviderRouteList(source?.[network], {
+      network,
+      fallback: DEFAULT_PROVIDER_ROUTING[network],
+    })
   }
 
   return normalized
+}
+
+function providerRouteListsDiffer(a = [], b = []) {
+  return a.length !== b.length || a.some((provider, index) => provider !== b[index])
 }
 
 async function ensureProviderRoutingSettings() {
@@ -813,7 +885,9 @@ async function ensureProviderRoutingSettings() {
   const snapshot = await ref.once("value")
   const current = snapshot.exists() ? snapshot.val() : {}
   const normalized = normalizeProviderRouting(current)
-  const hasChanges = SUPPORTED_PACKAGE_NETWORKS.some((network) => normalized[network] !== current?.[network])
+  const hasChanges = SUPPORTED_PACKAGE_NETWORKS.some((network) =>
+    providerRouteListsDiffer(normalized[network], normalizeProviderRouteList(current?.[network], { network })),
+  )
 
   if (hasChanges || !snapshot.exists()) {
     await ref.set({
@@ -831,9 +905,22 @@ async function getProviderRoutingConfig() {
   return normalizeProviderRouting(snapshot.exists() ? snapshot.val() : {})
 }
 
-async function getActiveProviderForNetwork(network) {
+/** The ordered list of providers routed for a network, primary first. */
+async function getProviderRouteForNetwork(network) {
   const routing = await getProviderRoutingConfig()
-  return normalizeProviderRoutingValue(network, routing[normalizeNetwork(network)])
+  return routing[normalizeNetwork(network)] || normalizeProviderRouteList(null, { network })
+}
+
+/**
+ * The primary provider for a network.
+ *
+ * This is the one the shop prices against and the one a purchase is attempted
+ * on first. It is NOT necessarily the one that ends up serving the order - see
+ * the dispatch loop's failover.
+ */
+async function getActiveProviderForNetwork(network) {
+  const route = await getProviderRouteForNetwork(network)
+  return route[0] || normalizeProviderRoutingValue(network, null)
 }
 
 async function normalizeCatalogPackages() {
@@ -961,6 +1048,12 @@ async function getUserWalletRecord(uid) {
 
   return {
     balance: toMoneyNumber(wallet.balance, 0),
+    // Funds reserved by a purchase that is mid-dispatch. They are still the
+    // customer's money - nothing has been charged - but they cannot be spent
+    // again until that purchase settles, so `availableBalance` is what any
+    // "can they afford this?" decision must use.
+    heldBalance: getHeldWalletBalance(wallet),
+    availableBalance: getAvailableWalletBalance(wallet),
     updatedAt: toTimestampValue(wallet.updatedAt, null),
   }
 }
@@ -1017,6 +1110,8 @@ async function getUserDashboardData(uid) {
 
   return {
     balance: wallet.balance,
+    availableBalance: wallet.availableBalance,
+    heldBalance: wallet.heldBalance,
     walletUpdatedAt: wallet.updatedAt,
     ordersCount: validOrders.length,
     totalSales: toMoneyNumber(totalSales, 0),
@@ -1142,9 +1237,9 @@ async function isPrivilegedUser(uid) {
  * explicit `true` from the role lookup, so an absent uid or a failed lookup
  * falls back to the regular price rather than granting a discount.
  */
-async function getEffectivePackagePrice(catalogEntry, uid) {
+async function getEffectivePackagePrice(catalogEntry, uid, { provider = "" } = {}) {
   const agentPricing = uid ? await isPrivilegedUser(uid) : false
-  return resolveEffectivePackagePrice(catalogEntry, { agentPricing })
+  return resolveEffectivePackagePrice(catalogEntry, { agentPricing, provider })
 }
 
 function getAfaRegistrationFeeRef() {
@@ -1206,45 +1301,84 @@ function isTransientRealtimeDisconnectError(error) {
   )
 }
 
+/**
+ * The credential each provider cannot place an order without.
+ *
+ * One table, consulted by both the boolean check and the throwing assert. The
+ * failure this shape prevents: a second, inline "is it configured?" test that
+ * falls back to a different provider's key, which reports a route as usable
+ * purely because an unrelated provider happens to be set up.
+ */
+const PROVIDER_CREDENTIALS = {
+  hubnet: {
+    getKey: () => CONFIG.hubnetApiKey,
+    message: "HubNet is routed for one or more networks, but HUBNET_API_KEY is missing.",
+  },
+  godsway: {
+    getKey: () => CONFIG.godswayApiKey,
+    message: "CK-Godsway is routed for one or more networks, but GODSWAY_API_KEY is missing.",
+  },
+  gigshub: {
+    getKey: () => CONFIG.gigshubApiKey,
+    message: "GiGSHUB is routed for one or more networks, but GIGSHUB_API_KEY is missing.",
+  },
+  pbmhub: {
+    getKey: () => CONFIG.pbmhubApiKey,
+    message: "PBM HUB is routed for one or more networks, but PBMHUB_API_KEY is missing.",
+  },
+}
+
+/** Whether a provider has the credentials it needs to place an order. */
+function isProviderConfigured(provider) {
+  const entry = PROVIDER_CREDENTIALS[normalizeProvider(provider, "")]
+  return entry ? Boolean(String(entry.getKey() || "").trim()) : false
+}
+
 function assertProviderConfigured(provider, context = "runtime") {
-  const safeProvider = normalizeProvider(provider)
-  if (safeProvider === "hubnet" && !CONFIG.hubnetApiKey) {
+  const safeProvider = normalizeProvider(provider, "")
+  const entry = PROVIDER_CREDENTIALS[safeProvider]
+  if (entry && !isProviderConfigured(safeProvider)) {
     throw createAppError("PROVIDER_CONFIGURATION_MISSING", {
-      provider: "hubnet",
+      provider: safeProvider,
       context,
-      providerMessage: "HubNet is routed for one or more networks, but HUBNET_API_KEY is missing.",
-    })
-  }
-
-  if (safeProvider === "godsway" && !CONFIG.godswayApiKey) {
-    throw createAppError("PROVIDER_CONFIGURATION_MISSING", {
-      provider: "godsway",
-      context,
-      providerMessage: "CK-Godsway is routed for one or more networks, but GODSWAY_API_KEY is missing.",
-    })
-  }
-
-  if (safeProvider === "gigshub" && !CONFIG.gigshubApiKey) {
-    throw createAppError("PROVIDER_CONFIGURATION_MISSING", {
-      provider: "gigshub",
-      context,
-      providerMessage: "GiGSHUB is routed for one or more networks, but GIGSHUB_API_KEY is missing.",
-    })
-  }
-
-  if (safeProvider === "pbmhub" && !CONFIG.pbmhubApiKey) {
-    throw createAppError("PROVIDER_CONFIGURATION_MISSING", {
-      provider: "pbmhub",
-      context,
-      providerMessage: "PBM HUB is routed for one or more networks, but PBMHUB_API_KEY is missing.",
+      providerMessage: entry.message,
     })
   }
 }
 
+/**
+ * The providers that may attempt one specific purchase, in dispatch order.
+ *
+ * Combines the admin's route with the two things that vary per order: whether
+ * each provider is configured at all, and whether this particular package has a
+ * complete mapping for it. An empty result is a distinct outcome, not a generic
+ * failure - it means the admin's routing cannot serve this order, and the
+ * `skipped` list says which provider fell out and why.
+ */
+async function resolvePurchaseProviderCandidates(network, catalogEntry) {
+  const safeNetwork = normalizeNetwork(network)
+  const route = await getProviderRouteForNetwork(safeNetwork)
+  const { candidates, skipped } = buildProviderCandidates(route, {
+    isConfigured: isProviderConfigured,
+    hasCompleteMapping: (provider) => isCompleteProviderMapping(safeNetwork, provider, catalogEntry),
+  })
+
+  return { route, candidates, skipped }
+}
+
+/**
+ * Every provider in every route must have its credentials, not just the primary.
+ *
+ * A failover provider with no API key is worse than useless: it looks like
+ * redundancy on the admin screen and contributes nothing when the primary goes
+ * down, which is precisely when it is needed.
+ */
 async function validateProviderSecretsForRouting(routing = null) {
   const currentRouting = routing || (await getProviderRoutingConfig())
   for (const network of SUPPORTED_PACKAGE_NETWORKS) {
-    assertProviderConfigured(currentRouting[network], `routing:${network}`)
+    for (const provider of normalizeProviderRouteList(currentRouting[network], { network })) {
+      assertProviderConfigured(provider, `routing:${network}`)
+    }
   }
 }
 
@@ -1998,6 +2132,137 @@ async function updateWalletBalance(
   throw createAppError("WALLET_TRANSACTION_ABORTED", lastAbortDetails || {
     requiredAmount,
   })
+}
+
+/**
+ * Reserve, then commit or return, funds for one purchase.
+ *
+ * `hold` reserves without charging: the amount stops being spendable so two
+ * purchases cannot claim it, but the balance itself does not move. `capture`
+ * turns the reservation into a real debit once a provider has taken the order;
+ * `release` gives it back when none would. A purchase that fails everywhere
+ * therefore leaves no debit and no refund in the ledger at all.
+ *
+ * Every operation is keyed on `holdId` and safe to replay. The decision lives in
+ * ./lib/wallet-core.js; this function owns only the RTDB plumbing.
+ */
+async function applyWalletHold(
+  uid,
+  operation,
+  holdId,
+  { amount = 0, reference = null, reason = "", details = {} } = {},
+) {
+  const walletRef = db.ref(`wallets/${uid}`)
+  const safeHoldId = sanitizeMutationId(holdId, holdId ? hashStableKey(holdId) : "")
+  if (!safeHoldId) {
+    throw createAppError("WALLET_HOLD_ID_REQUIRED", {
+      providerMessage: "A hold id is required to reserve or settle funds.",
+    })
+  }
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const initialSnapshot = await walletRef.once("value")
+    const initialWalletValue = initialSnapshot.exists() ? initialSnapshot.val() : {}
+    let outcome = null
+    let snapshotState = null
+
+    const transactionResult = await walletRef.transaction((current) => {
+      const result = computeWalletHoldMutation(current, {
+        initialWalletValue,
+        operation,
+        holdId: safeHoldId,
+        amount,
+        reference,
+        reason,
+        details,
+      })
+
+      outcome = result.outcome
+      snapshotState = result
+
+      if (result.outcome === WALLET_MUTATION.COMMIT) {
+        return result.wallet
+      }
+
+      // Everything else is a no-op: abort so RTDB writes nothing at all.
+      return
+    })
+
+    if (transactionResult.committed) {
+      const nextWallet = transactionResult.snapshot.val() || {}
+      return {
+        outcome: WALLET_MUTATION.COMMIT,
+        balance: toMoneyNumber(nextWallet.balance, 0),
+        heldBalance: getHeldWalletBalance(nextWallet),
+        availableBalance: getAvailableWalletBalance(nextWallet),
+      }
+    }
+
+    // A duplicate is success — the operation already happened. The others are
+    // terminal and must be reported so the caller can refuse to move money.
+    if (
+      outcome === WALLET_MUTATION.DUPLICATE ||
+      outcome === WALLET_MUTATION.INSUFFICIENT ||
+      outcome === WALLET_MUTATION.MISSING ||
+      outcome === WALLET_MUTATION.CONFLICT
+    ) {
+      if (outcome === WALLET_MUTATION.INSUFFICIENT) {
+        const requiredAmount = toMoneyNumber(amount, 0)
+        const availableBalance = toMoneyNumber(snapshotState?.availableBalance, 0)
+        logger.warn("Wallet hold refused for insufficient funds", {
+          uid,
+          requiredAmount,
+          availableBalance,
+          heldBalance: toMoneyNumber(snapshotState?.heldBalance, 0),
+        })
+        throw createAppError("INSUFFICIENT_WALLET_BALANCE", {
+          availableBalance,
+          requiredAmount,
+          shortfall: Math.max(0, toMoneyNumber(requiredAmount - availableBalance, 0)),
+        })
+      }
+
+      if (outcome === WALLET_MUTATION.CONFLICT || outcome === WALLET_MUTATION.MISSING) {
+        logger.error("Wallet hold could not be settled", new Error(outcome), {
+          uid,
+          holdId: safeHoldId,
+          operation,
+          outcome,
+        })
+      }
+
+      return {
+        outcome,
+        balance: toMoneyNumber(snapshotState?.currentBalance, 0),
+        heldBalance: toMoneyNumber(snapshotState?.heldBalance, 0),
+        availableBalance: toMoneyNumber(snapshotState?.availableBalance, 0),
+      }
+    }
+
+    logger.warn("Wallet hold transaction aborted before commit; retrying", { uid, holdId: safeHoldId, operation, attempt })
+  }
+
+  throw createAppError("WALLET_TRANSACTION_ABORTED", { holdId: safeHoldId, operation })
+}
+
+/** Reserve funds for a purchase. Throws INSUFFICIENT_WALLET_BALANCE if it cannot. */
+async function holdWalletBalance(uid, amount, { holdId, reference = null, reason = "", details = {} } = {}) {
+  return await applyWalletHold(uid, WALLET_HOLD_OPERATION.HOLD, holdId, {
+    amount,
+    reference,
+    reason,
+    details,
+  })
+}
+
+/** Turn a reservation into a real debit, once a provider has taken the order. */
+async function captureWalletHold(uid, holdId, { reference = null, reason = "" } = {}) {
+  return await applyWalletHold(uid, WALLET_HOLD_OPERATION.CAPTURE, holdId, { reference, reason })
+}
+
+/** Give a reservation back. The customer is never charged. */
+async function releaseWalletHold(uid, holdId, { reference = null, reason = "" } = {}) {
+  return await applyWalletHold(uid, WALLET_HOLD_OPERATION.RELEASE, holdId, { reference, reason })
 }
 
 async function recordTransaction({
@@ -3290,6 +3555,14 @@ export {
   ensureProviderRoutingSettings,
   getProviderRoutingConfig,
   getActiveProviderForNetwork,
+  getProviderRouteForNetwork,
+  resolvePurchaseProviderCandidates,
+  isProviderConfigured,
+  normalizeProviderRouteList,
+  buildProviderCandidates,
+  hasCandidateAfter,
+  listRoutableProviders,
+  CANDIDATE_SKIP_REASON,
   normalizeCatalogPackages,
   getCatalogPackages,
   getCatalogPackage,
@@ -3304,6 +3577,8 @@ export {
   resolveUserPrice,
   resolveAgentPrice,
   resolveEffectivePackagePrice,
+  resolveProviderPricePair,
+  normalizeProviderPricing,
   getAfaRegistrationFee,
   setAfaRegistrationFee,
   sleep,
@@ -3338,6 +3613,9 @@ export {
   sanitizePhoneNumber,
   buildFrontendUrl,
   updateWalletBalance,
+  holdWalletBalance,
+  captureWalletHold,
+  releaseWalletHold,
   recordTransaction,
   toTimestampValue,
   normalizeOrderSyncState,

@@ -95,6 +95,13 @@ export interface AdminPackage {
   updatedAt?: number;
   updatedBy?: string;
   providerMappings?: Record<string, unknown>;
+  /** Per-provider price overrides. A missing provider inherits the row price. */
+  providerPricing?: Record<string, { userPrice?: number; agentPrice?: number }>;
+  /**
+   * What each provider would actually charge, resolved by the backend through
+   * the same fallbacks the till uses (read-only — never sent back on save).
+   */
+  providerPrices?: Record<string, ProviderPricePair>;
   /**
    * Required mapping fields this package leaves blank for the network's active
    * provider, computed by the backend (read-only — never sent back on save).
@@ -135,8 +142,12 @@ export interface AdminCatalogResult {
   activeProvider: string;
 }
 
-/** Network → provider routing map. */
-export type ProviderRouting = Record<string, string>;
+/**
+ * Network → ordered provider list. Index 0 is the primary: it is what the shop
+ * quotes against and what a purchase is attempted on first. The rest are
+ * failover, tried in order and only after a definitive refusal.
+ */
+export type ProviderRouting = Record<string, string[]>;
 
 /** GET /api/admin/provider-routing */
 export interface ProviderRoutingData {
@@ -144,6 +155,18 @@ export interface ProviderRoutingData {
   updatedAt?: number | null;
   updatedBy?: string | null;
 }
+
+/** What one provider would charge for a package, resolved through fallbacks. */
+export interface ProviderPricePair {
+  provider: string;
+  userPrice: number;
+  agentPrice: number;
+  /** False when this provider simply inherits the package price. */
+  overridden: boolean;
+}
+
+/** Per-provider price overrides, as edited. Blank means "inherit". */
+export type ProviderPricing = Record<string, { userPrice?: number; agentPrice?: number }>;
 
 /** GET /api/admin/provider-health (rendered generically). */
 export interface ProviderHealthData {

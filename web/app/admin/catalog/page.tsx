@@ -38,6 +38,12 @@ interface EditRow {
   sortOrder: string;
   enabled: boolean;
   providerMappings: Record<string, unknown>;
+  /**
+   * Per-provider price overrides, held as strings so a blank field stays blank.
+   * Blank means "inherit the row price" — storing 0 would sell the bundle for
+   * nothing the moment that provider served an order.
+   */
+  providerPricing: Record<string, { userPrice: string; agentPrice: string }>;
   /** Fields the backend says are blank for the active provider (server truth). */
   mappingMissing: string[];
   /** Mapping edited since the last load, so the server verdict is stale. */
@@ -55,12 +61,42 @@ function toEditRow(p: AdminPackage): EditRow {
     sortOrder: p.sortOrder != null ? String(p.sortOrder) : "",
     enabled: p.enabled !== false,
     providerMappings: (p.providerMappings as Record<string, unknown>) || {},
+    providerPricing: Object.fromEntries(
+      ADMIN_PROVIDERS.map((provider) => {
+        const entry = p.providerPricing?.[provider];
+        return [
+          provider,
+          {
+            userPrice: entry?.userPrice != null ? String(entry.userPrice) : "",
+            agentPrice: entry?.agentPrice != null ? String(entry.agentPrice) : "",
+          },
+        ];
+      }),
+    ),
     mappingMissing: Array.isArray(p.mappingMissing) ? p.mappingMissing : [],
     mappingDirty: false,
   };
 }
 
 function toPackage(r: EditRow): AdminPackage {
+  // Only positive overrides are sent. A blank field must not become 0: the
+  // backend drops zeroes anyway, but sending them makes the intent ambiguous.
+  const providerPricing: Record<string, { userPrice?: number; agentPrice?: number }> = {};
+  for (const [provider, prices] of Object.entries(r.providerPricing ?? {})) {
+    const userPrice = Number(prices.userPrice);
+    const agentPrice = Number(prices.agentPrice);
+    const entry: { userPrice?: number; agentPrice?: number } = {};
+    if (prices.userPrice.trim() && Number.isFinite(userPrice) && userPrice > 0) {
+      entry.userPrice = userPrice;
+    }
+    if (prices.agentPrice.trim() && Number.isFinite(agentPrice) && agentPrice > 0) {
+      entry.agentPrice = agentPrice;
+    }
+    if (Object.keys(entry).length) {
+      providerPricing[provider] = entry;
+    }
+  }
+
   return {
     id: r.id || undefined,
     label: r.label,
@@ -70,7 +106,16 @@ function toPackage(r: EditRow): AdminPackage {
     sortOrder: Number(r.sortOrder) || 0,
     enabled: r.enabled,
     providerMappings: r.providerMappings,
+    providerPricing,
   } as AdminPackage;
+}
+
+/** Providers this row prices differently from the row's own price. */
+function overriddenProviders(row: EditRow): string[] {
+  return ADMIN_PROVIDERS.filter((provider) => {
+    const entry = row.providerPricing?.[provider];
+    return Boolean(entry?.userPrice.trim() || entry?.agentPrice.trim());
+  });
 }
 
 /** Pull one provider's mapping values out of a package, as editable strings. */
@@ -121,6 +166,8 @@ export default function AdminCatalogPage() {
   const [mappingText, setMappingText] = useState("");
   const [showRawMapping, setShowRawMapping] = useState(false);
 
+  const [pricingKey, setPricingKey] = useState<string | null>(null);
+
   const [routingDraft, setRoutingDraft] = useState<ProviderRouting>({});
   const [savingRouting, setSavingRouting] = useState(false);
 
@@ -161,6 +208,9 @@ export default function AdminCatalogPage() {
         sortOrder: "",
         enabled: false,
         providerMappings: {},
+        providerPricing: Object.fromEntries(
+          ADMIN_PROVIDERS.map((provider) => [provider, { userPrice: "", agentPrice: "" }]),
+        ),
         mappingMissing: [],
         mappingDirty: true,
       },
@@ -229,6 +279,30 @@ export default function AdminCatalogPage() {
     toast.info("Mapping staged — remember to save the catalog");
   };
 
+  /**
+   * Set one slot in a network's ordered route.
+   *
+   * Clearing a slot removes it and closes the gap rather than leaving a hole,
+   * so the remaining providers keep a contiguous priority order. Clearing the
+   * primary promotes the next one up — a network is never left with a route
+   * that starts empty.
+   */
+  const setRouteSlot = (network: string, slotIndex: number, provider: string) => {
+    setRoutingDraft((prev) => {
+      const current = [...(prev[network] ?? [])];
+      if (provider) {
+        current[slotIndex] = provider;
+      } else {
+        current.splice(slotIndex, 1);
+      }
+
+      // Guards against a stale render briefly offering an already-picked
+      // provider: the same provider twice would attempt it against itself.
+      const deduped = current.filter((entry, index) => entry && current.indexOf(entry) === index);
+      return { ...prev, [network]: deduped };
+    });
+  };
+
   const saveRouting = async () => {
     setSavingRouting(true);
     try {
@@ -275,7 +349,7 @@ export default function AdminCatalogPage() {
       <Card className="flex flex-col gap-4">
         <CardHeader
           title="Provider routing"
-          description="Which upstream provider fulfils each network."
+          description="Which providers fulfil each network, in order. The 1st is the primary — it sets the price customers see and takes every order it can. The rest are only tried if it definitively refuses."
         />
         {routingQuery.loading && !routingQuery.data ? (
           <Skeleton className="h-24 rounded-lg" />
@@ -284,29 +358,62 @@ export default function AdminCatalogPage() {
         ) : (
           <>
             <div className="grid gap-3 sm:grid-cols-3">
-              {ADMIN_NETWORKS.map((net) => (
-                <div key={net} className="rounded-lg border border-border p-3">
-                  <p className="mb-2 flex items-center gap-1.5 text-sm font-medium text-ink">
-                    <NetworkDot network={net} />
-                    {net.toUpperCase()}
-                  </p>
-                  <Select
-                    aria-label={`Provider for ${net}`}
-                    className="h-10"
-                    value={routingDraft[net] || ""}
-                    onChange={(e) => setRoutingDraft((prev) => ({ ...prev, [net]: e.target.value }))}
-                  >
-                    <option value="" disabled>
-                      Select provider
-                    </option>
-                    {ADMIN_PROVIDERS.map((p) => (
-                      <option key={p} value={p}>
-                        {p}
-                      </option>
-                    ))}
-                  </Select>
-                </div>
-              ))}
+              {ADMIN_NETWORKS.map((net) => {
+                const route = routingDraft[net] ?? [];
+                // One slot per provider at most: a provider listed twice would
+                // just be retried against itself, which is never useful.
+                const slots = [...route, ""].slice(0, ADMIN_PROVIDERS.length);
+                return (
+                  <div key={net} className="rounded-lg border border-border p-3">
+                    <p className="mb-2 flex items-center gap-1.5 text-sm font-medium text-ink">
+                      <NetworkDot network={net} />
+                      {net.toUpperCase()}
+                    </p>
+                    <div className="flex flex-col gap-2">
+                      {slots.map((selected, slotIndex) => (
+                        <div key={`${net}-${slotIndex}`} className="flex items-center gap-2">
+                          <span
+                            className="w-14 shrink-0 text-xs font-medium text-muted"
+                            title={slotIndex === 0 ? "Primary — sets the price" : `Fallback ${slotIndex}`}
+                          >
+                            {slotIndex === 0 ? "1st" : `${slotIndex + 1}${slotIndex === 1 ? "nd" : slotIndex === 2 ? "rd" : "th"}`}
+                          </span>
+                          <Select
+                            aria-label={
+                              slotIndex === 0
+                                ? `Primary provider for ${net}`
+                                : `Fallback ${slotIndex} for ${net}`
+                            }
+                            className="h-10"
+                            value={selected}
+                            onChange={(e) => setRouteSlot(net, slotIndex, e.target.value)}
+                          >
+                            <option value="">
+                              {slotIndex === 0 ? "Select provider" : "— none —"}
+                            </option>
+                            {ADMIN_PROVIDERS.filter(
+                              (p) => p === selected || !route.includes(p),
+                            ).map((p) => (
+                              <option key={p} value={p}>
+                                {p}
+                              </option>
+                            ))}
+                          </Select>
+                        </div>
+                      ))}
+                    </div>
+                    {route.length > 1 ? (
+                      <p className="mt-2 text-xs text-muted">
+                        Falls back to {route.slice(1).join(" → ")}
+                      </p>
+                    ) : (
+                      <p className="mt-2 text-xs text-warning">
+                        No failover — if {route[0] || "this provider"} refuses, the order fails.
+                      </p>
+                    )}
+                  </div>
+                );
+              })}
             </div>
             <div className="flex items-center justify-between gap-3">
               <p className="text-xs text-muted">
@@ -460,14 +567,28 @@ export default function AdminCatalogPage() {
                             </button>
                           </Td>
                           <Td>
-                            <button
-                              type="button"
-                              onClick={() => openMapping(r)}
-                              className="inline-flex items-center gap-1.5"
-                              title={mappingBadge.title}
-                            >
-                              <Badge tone={mappingBadge.tone}>{mappingBadge.text}</Badge>
-                            </button>
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => openMapping(r)}
+                                className="inline-flex items-center gap-1.5"
+                                title={mappingBadge.title}
+                              >
+                                <Badge tone={mappingBadge.tone}>{mappingBadge.text}</Badge>
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setPricingKey(r._key)}
+                                className="inline-flex items-center gap-1.5"
+                                title="Set a different price per provider"
+                              >
+                                <Badge tone={overriddenProviders(r).length ? "info" : "neutral"}>
+                                  {overriddenProviders(r).length
+                                    ? `${overriddenProviders(r).length} custom`
+                                    : "Prices"}
+                                </Badge>
+                              </button>
+                            </div>
                           </Td>
                           <Td className="text-right">
                             <Button
@@ -534,6 +655,95 @@ export default function AdminCatalogPage() {
           </div>
         )}
       </Card>
+
+      {/* Per-provider pricing */}
+      <Modal
+        open={pricingKey !== null}
+        onClose={() => setPricingKey(null)}
+        title="Per-provider pricing"
+        description={`What to charge when each provider fulfils this ${network.toUpperCase()} bundle. Leave blank to use the package price.`}
+        size="lg"
+        footer={
+          <Button variant="primary" size="sm" onClick={() => setPricingKey(null)}>
+            Done
+          </Button>
+        }
+      >
+        {(() => {
+          const row = rows.find((r) => r._key === pricingKey);
+          if (!row) return null;
+          const primary = routingDraft[network]?.[0] || activeProvider;
+
+          return (
+            <div className="flex flex-col gap-4">
+              <p className="text-xs text-muted">
+                Customers are quoted and charged the{" "}
+                <span className="font-medium text-ink-soft">primary</span> provider&apos;s price. If an
+                order fails over to another provider, the customer still pays the quoted price — the
+                difference comes out of your margin, not theirs.
+              </p>
+
+              {ADMIN_PROVIDERS.map((provider) => {
+                const prices = row.providerPricing?.[provider] ?? { userPrice: "", agentPrice: "" };
+                const isPrimary = provider === primary;
+                return (
+                  <div
+                    key={provider}
+                    className={`rounded-lg border p-3 ${isPrimary ? "border-brand/50 bg-brand-soft/30" : "border-border"}`}
+                  >
+                    <p className="mb-2 flex items-center gap-2 text-sm font-medium capitalize text-ink">
+                      {provider}
+                      {isPrimary ? <Badge tone="success">Primary — sets the shop price</Badge> : null}
+                    </p>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <Field label="User price" htmlFor={`price-${provider}-user`}>
+                        <Input
+                          id={`price-${provider}-user`}
+                          type="number"
+                          step="0.01"
+                          min="0"
+                          placeholder={row.userPrice || "inherit"}
+                          value={prices.userPrice}
+                          onChange={(e) =>
+                            updateRow(row._key, {
+                              providerPricing: {
+                                ...row.providerPricing,
+                                [provider]: { ...prices, userPrice: e.target.value },
+                              },
+                            })
+                          }
+                        />
+                      </Field>
+                      <Field label="Agent price" htmlFor={`price-${provider}-agent`}>
+                        <Input
+                          id={`price-${provider}-agent`}
+                          type="number"
+                          step="0.01"
+                          min="0"
+                          placeholder={row.agentPrice || "inherit"}
+                          value={prices.agentPrice}
+                          onChange={(e) =>
+                            updateRow(row._key, {
+                              providerPricing: {
+                                ...row.providerPricing,
+                                [provider]: { ...prices, agentPrice: e.target.value },
+                              },
+                            })
+                          }
+                        />
+                      </Field>
+                    </div>
+                  </div>
+                );
+              })}
+
+              <p className="text-xs text-muted">
+                Changes are staged — save the catalog to apply them.
+              </p>
+            </div>
+          );
+        })()}
+      </Modal>
 
       {/* Provider mapping editor */}
       <Modal

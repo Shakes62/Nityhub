@@ -28,7 +28,7 @@ import {
   pbmhubCircuitBreaker,
 } from "./lib/http.js"
 import { generateReference } from "./lib/reference.js"
-import { enqueueRefund } from "./refund-queue.js"
+import { WALLET_MUTATION } from "./lib/wallet-core.js"
 import {
   processedTransactions,
   duplicateAttempts,
@@ -109,6 +109,11 @@ import {
   ensureProviderRoutingSettings,
   getProviderRoutingConfig,
   getActiveProviderForNetwork,
+  getProviderRouteForNetwork,
+  resolvePurchaseProviderCandidates,
+  isProviderConfigured,
+  hasCandidateAfter,
+  listRoutableProviders,
   normalizeCatalogPackages,
   getCatalogPackages,
   getCatalogPackage,
@@ -120,6 +125,7 @@ import {
   getAdminOverviewData,
   isPrivilegedUser,
   getEffectivePackagePrice,
+  resolveProviderPricePair,
   resolveUserPrice,
   resolveAgentPrice,
   resolveEffectivePackagePrice,
@@ -159,6 +165,9 @@ import {
   sanitizePhoneNumber,
   buildFrontendUrl,
   updateWalletBalance,
+  holdWalletBalance,
+  captureWalletHold,
+  releaseWalletHold,
   recordTransaction,
   toTimestampValue,
   normalizeOrderSyncState,
@@ -205,6 +214,7 @@ import {
   getProviderErrorMessage,
   isIndeterminateProviderSubmissionError,
   getIndeterminateProviderSubmissionMessage,
+  preferInformativeProviderFailure,
   reconciliationInFlight,
   getOrderSyncBackoffDelay,
   acquireOrderSyncLease,
@@ -760,10 +770,14 @@ app.get("/api/packages/:network", optionalAuthenticateRequest, async (req, res) 
     // Anonymous callers and failed role lookups both fall back to regular
     // pricing: a discount is only ever granted on an explicit true.
     const agentPricing = uid ? await isPrivilegedUser(uid).catch(() => false) : false
+    // Priced against the primary provider for this network — the same one the
+    // purchase will be quoted and charged at, so the shelf price and the till
+    // price cannot disagree.
+    const activeProvider = await getActiveProviderForNetwork(network).catch(() => "")
     const rows = await getCatalogPackages(network)
     return res.json({
       status: "success",
-      data: rows.map((entry) => toPublicCatalogEntry(entry, { agentPricing })),
+      data: rows.map((entry) => toPublicCatalogEntry(entry, { agentPricing, provider: activeProvider })),
       timestamp: new Date().toISOString(),
     })
   } catch (error) {
@@ -788,21 +802,31 @@ app.get("/api/admin/packages/:network", authenticateRequest, requirePrivilegedAc
   }
 
   try {
-    const activeProvider = await getActiveProviderForNetwork(network)
+    const route = await getProviderRouteForNetwork(network)
+    const activeProvider = route[0] || ""
     const rows = await getCatalogPackages(network, { includeDisabled: true })
     // Ship the completeness verdict with each row. The admin editor used to
     // infer it from "does providerMappings[provider] exist", which is not the
     // rule the save path enforces - a row with an empty networkKey rendered as
     // "Mapped" and was then rejected on save with no indication of which row.
+    //
+    // `providerPrices` is resolved the same way the till resolves it, so the
+    // number shown against each provider is the number a customer would be
+    // charged if that provider served the order - not a raw, possibly blank,
+    // override.
     const data = rows.map((entry) => ({
       ...entry,
       mappingMissing: describeProviderMappingGaps(network, activeProvider, entry).missing,
+      providerPrices: Object.fromEntries(
+        listRoutableProviders().map((provider) => [provider, resolveProviderPricePair(entry, provider)]),
+      ),
     }))
 
     return res.json({
       status: "success",
       data,
       activeProvider,
+      route,
       timestamp: new Date().toISOString(),
     })
   } catch (error) {
@@ -843,12 +867,21 @@ app.put("/api/admin/provider-routing", authenticateRequest, requirePrivilegedAcc
   const requestedRouting = req.body?.routing
   const source = requestedRouting && typeof requestedRouting === "object" ? requestedRouting : req.body || {}
 
+  // Each network now carries an ordered list: position 0 is the primary and the
+  // rest are failover. A single string is still accepted, so an older client
+  // (or a saved config) keeps working.
   for (const network of SUPPORTED_PACKAGE_NETWORKS) {
-    const requestedProvider = source?.[network]
-    if (requestedProvider != null && !normalizeProvider(requestedProvider)) {
+    const requested = source?.[network]
+    if (requested == null) {
+      continue
+    }
+
+    const entries = Array.isArray(requested) ? requested : [requested]
+    const invalidProvider = entries.find((entry) => entry != null && entry !== "" && !normalizeProvider(entry))
+    if (invalidProvider !== undefined) {
       return res.status(400).json({
         status: "error",
-        message: `Invalid provider for ${network}. Supported values: ${SUPPORTED_PROVIDERS.join(", ")}`,
+        message: `Invalid provider "${invalidProvider}" for ${network}. Supported values: ${SUPPORTED_PROVIDERS.join(", ")}`,
         timestamp: new Date().toISOString(),
       })
     }
@@ -858,15 +891,22 @@ app.put("/api/admin/provider-routing", authenticateRequest, requirePrivilegedAcc
     const routing = normalizeProviderRouting(source)
     await validateProviderSecretsForRouting(routing)
 
+    // Every provider in the route is validated, not just the primary: a
+    // fallback that cannot fulfil the catalog is not a fallback at all, and the
+    // first time anyone finds out would be mid-outage.
     for (const network of SUPPORTED_PACKAGE_NETWORKS) {
       const rows = await getCatalogPackages(network, { includeDisabled: true })
-      const invalidEntry = rows.find((entry) => entry.enabled !== false && !isCompleteProviderMapping(network, routing[network], entry))
-      if (invalidEntry) {
-        return res.status(400).json({
-          status: "error",
-          message: `Cannot route ${network.toUpperCase()} to ${routing[network]}. ${describeProviderMappingGapMessage(network, routing[network], invalidEntry)}`,
-          timestamp: new Date().toISOString(),
-        })
+      for (const routedProvider of routing[network]) {
+        const invalidEntry = rows.find(
+          (entry) => entry.enabled !== false && !isCompleteProviderMapping(network, routedProvider, entry),
+        )
+        if (invalidEntry) {
+          return res.status(400).json({
+            status: "error",
+            message: `Cannot route ${network.toUpperCase()} to ${routedProvider}. ${describeProviderMappingGapMessage(network, routedProvider, invalidEntry)}`,
+            timestamp: new Date().toISOString(),
+          })
+        }
       }
     }
 
@@ -1825,7 +1865,35 @@ app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, a
       })
     }
 
-    const amount = await getEffectivePackagePrice(catalogEntry, userId)
+    // Resolved before the price, because the price is the PRIMARY provider's.
+    // Filtered to who can actually serve this package, so an unconfigured or
+    // unmapped provider is out of the running before any money is reserved.
+    const { route, candidates, skipped } = await resolvePurchaseProviderCandidates(network, catalogEntry)
+    if (!candidates.length) {
+      // A distinct outcome, not a generic failure: it says the routing cannot
+      // serve this order, which is a config mistake rather than an outage.
+      logger.error("Purchase has no provider routed", new Error("NO_PROVIDER_ROUTED"), {
+        userId,
+        network,
+        packageId: catalogEntry.id,
+        route,
+        skipped,
+      })
+      return res.status(503).json({
+        status: "error",
+        errorCode: "NO_PROVIDER_ROUTED",
+        message: "This bundle cannot be delivered right now. Please try again shortly.",
+        timestamp: new Date().toISOString(),
+      })
+    }
+
+    // Tracks whichever provider is currently being attempted: the primary at
+    // first, then each failover in turn. Everything downstream - the order
+    // record, the error message, the parked-order note - refers to the provider
+    // the order actually reached, not the one it started at.
+    let provider = candidates[0].provider
+    const primaryProvider = provider
+    const amount = await getEffectivePackagePrice(catalogEntry, userId, { provider: primaryProvider })
     if (!amount || amount <= 0) {
       return res.status(400).json({
         status: "error",
@@ -1833,9 +1901,6 @@ app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, a
         timestamp: new Date().toISOString(),
       })
     }
-
-    const provider = await getActiveProviderForNetwork(network)
-    assertProviderConfigured(provider, `wallet_purchase:${network}`)
     const activeIntent = await findMatchingActivePurchaseIntent({
       userId,
       network,
@@ -1913,10 +1978,16 @@ app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, a
     }
 
     const reference = generateReference(network === "telecel" ? "TELECEL_PBM" : `${network.toUpperCase()}_PBM`)
+    // One id for the whole reservation lifecycle. Holding, capturing and
+    // releasing all key on it, so every one of them is safe to replay.
+    const holdId = sanitizeMutationId(`purchase-hold:${reference}`)
+    // Still needed for the ledger entry a capture writes. There is no refund
+    // mutation any more: a purchase no provider took releases its reservation
+    // instead, which never moved the balance and so has nothing to reverse.
     const debitMutationId = sanitizeMutationId(`purchase-debit:${reference}`)
-    const refundMutationId = sanitizeMutationId(`purchase-refund:${reference}`)
     let balance = 0
-    let debited = false
+    let held = false
+    let captured = false
     let vendorCompleted = false
     await upsertPurchaseIntent(reference, {
       reference,
@@ -1942,30 +2013,120 @@ app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, a
     }).catch(() => null)
 
     try {
-      balance = await updateWalletBalance(userId, -amount, {
-        requireSufficient: true,
-        mutationId: debitMutationId,
-        reason: "wallet_purchase_debit",
+      // RESERVE, do not charge. The funds stop being spendable so a second
+      // purchase cannot claim them, but the balance does not move until a
+      // provider has actually taken the order.
+      const holdResult = await holdWalletBalance(userId, amount, {
+        holdId,
         reference,
+        reason: "wallet_purchase_hold",
         details: {
           network,
           phone,
           packageId: catalogEntry.id,
         },
       })
-      debited = true
+      held = true
+      balance = holdResult.balance
+
+      // Walk the route. A definitive refusal moves to the next provider; an
+      // uncertain one (timeout, connection reset) must NOT - the order may
+      // already be live upstream, and attempting it elsewhere would deliver and
+      // charge for the same bundle twice.
+      let providerResult = null
+      let lastFailure = null
+      const providerAttempts = []
+
+      for (const [index, candidate] of candidates.entries()) {
+        provider = candidate.provider
+        try {
+          providerResult = await getProviderAdapter(provider).purchase({
+            network,
+            phone,
+            reference,
+            catalogEntry,
+            amount,
+            hasNextProvider: hasCandidateAfter(candidates, index),
+          })
+          break
+        } catch (error) {
+          const errorCode = getErrorCode(error)
+          const uncertain = isIndeterminateProviderSubmissionError(error)
+          providerAttempts.push({
+            provider,
+            position: candidate.position,
+            errorCode,
+            uncertain,
+          })
+
+          logger.warn("Provider refused a purchase", {
+            reference,
+            provider,
+            position: candidate.position,
+            errorCode,
+            uncertain,
+            remaining: uncertain ? 0 : candidates.length - index - 1,
+            providerMessage: error?.providerMessage || error?.message || "",
+          })
+
+          if (uncertain) {
+            // Stop the chain and let the catch below hold the charge and park
+            // the order. Failing over here is the double-delivery bug.
+            error.providerAttempts = providerAttempts
+            throw error
+          }
+
+          // Keep the most informative reason: a trailing candidate that fails
+          // for a dull reason must not overwrite the real refusal.
+          lastFailure = preferInformativeProviderFailure(lastFailure, error)
+        }
+      }
+
+      if (!providerResult) {
+        // Every routed provider definitively refused. The hold is released in
+        // the catch below, so the customer is never charged a cedi.
+        const allFailed = lastFailure || createAppError("PROVIDER_PURCHASE_FAILED", {
+          providerMessage: "No provider accepted this order.",
+        })
+        allFailed.providerAttempts = providerAttempts
+        throw allFailed
+      }
+
+      // Set the instant a provider takes the order, BEFORE the charge. If the
+      // capture below fails, the catch must not release the reservation and
+      // mark the order failed - the provider already has it, and doing so would
+      // deliver the bundle for free.
+      vendorCompleted = true
+
+      if (providerAttempts.length) {
+        logger.info("Purchase served by a failover provider", {
+          reference,
+          primaryProvider,
+          servingProvider: provider,
+          failedOver: providerAttempts.map((item) => `${item.provider}(${item.errorCode})`),
+        })
+      }
 
       let vendorMeta = {}
-      const providerAdapter = getProviderAdapter(provider)
-      const providerResult = await providerAdapter.purchase({
-        network,
-        phone,
-        reference,
-        catalogEntry,
-        amount,
-      })
 
-      vendorCompleted = true
+      // CHARGE. Only now, and only because a provider took the order.
+      const captureResult = await captureWalletHold(userId, holdId, {
+        reference,
+        reason: "wallet_purchase_debit",
+      })
+      if (captureResult.outcome === WALLET_MUTATION.CONFLICT || captureResult.outcome === WALLET_MUTATION.MISSING) {
+        // The reservation is gone but the provider has the order. Never retry
+        // the charge blindly - surface it for a human instead.
+        logger.error("Provider accepted an order whose hold could not be captured", new Error(captureResult.outcome), {
+          userId,
+          reference,
+          provider,
+          outcome: captureResult.outcome,
+        })
+      }
+      captured = true
+      balance = captureResult.balance
+
       const storedProviderOrderNumber = resolveStoredProviderOrderNumber(
         provider,
         providerResult.providerOrderNumber || null,
@@ -2058,9 +2219,22 @@ app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, a
       })
     } catch (error) {
       const errorCode = getErrorCode(error)
-      const indeterminateProviderFailure = debited && !vendorCompleted && isIndeterminateProviderSubmissionError(error)
+      const indeterminateProviderFailure = held && !vendorCompleted && isIndeterminateProviderSubmissionError(error)
       if (indeterminateProviderFailure) {
+        // The order may be live upstream, so the customer IS charged: the
+        // reservation becomes a real debit and the order is parked for review.
+        // Releasing here would risk delivering a bundle for free.
         const pendingMessage = getIndeterminateProviderSubmissionMessage(provider)
+        const captureResult = await captureWalletHold(userId, holdId, {
+          reference,
+          reason: "wallet_purchase_debit_pending_confirmation",
+        }).catch((captureError) => {
+          logger.error("Failed to capture hold for an indeterminate purchase", captureError, { userId, reference })
+          return null
+        })
+        if (captureResult?.outcome === WALLET_MUTATION.COMMIT || captureResult?.outcome === WALLET_MUTATION.DUPLICATE) {
+          captured = true
+        }
         const currentWallet = await getUserWalletRecord(userId).catch(() => ({ balance }))
 
         await recordTransaction({
@@ -2152,37 +2326,36 @@ app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, a
         })
       }
 
-      if (debited && !vendorCompleted) {
+      if (held && !captured && !vendorCompleted) {
+        // Every routed provider definitively refused. RELEASE the reservation:
+        // the balance never moved, so there is no debit to reverse and no
+        // refund to issue - the customer simply gets their spendable balance
+        // back. This is the path the "never deducted" guarantee rests on.
+        let releaseFailed = false
         try {
-          balance = await updateWalletBalance(userId, amount, {
-            mutationId: refundMutationId,
-            reason: "wallet_purchase_refund",
+          const releaseResult = await releaseWalletHold(userId, holdId, {
             reference,
-            details: {
-              network,
-              phone,
-              packageId: catalogEntry.id,
-            },
+            reason: "wallet_purchase_release",
           })
-        } catch (refundError) {
-          logger.error("Wallet refund failed after purchase error", refundError, { userId, reference })
-          // The user is debited and the inline refund just failed. Durably queue
-          // it so the worker keeps retrying instead of the money being lost to
-          // this log line. Retrying is safe: refundMutationId is the wallet
-          // replay guard's key, so it can never refund twice.
-          await enqueueRefund({
+          balance = releaseResult.balance
+          releaseFailed = releaseResult.outcome === WALLET_MUTATION.CONFLICT
+        } catch (releaseError) {
+          releaseFailed = true
+          // The balance is untouched, so no money has been taken - but the
+          // amount stays reserved and unspendable until this is settled. It is
+          // deliberately NOT queued on the refund outbox: that credits a wallet,
+          // and crediting funds that were never debited would create money.
+          logger.error("[HOLD STUCK] Failed to release a hold after a failed purchase", releaseError, {
             userId,
             reference,
+            holdId,
             amount,
-            mutationId: refundMutationId,
-            reason: "wallet_purchase_refund",
-            details: { network, phone, packageId: catalogEntry.id },
-            lastError: refundError?.message || String(refundError),
-          }).catch((queueError) => {
-            logger.error("Refund enqueue failed after refund error", queueError, { userId, reference })
           })
         }
 
+        // Recorded as failed and terminal, so nothing downstream can pick it up
+        // and deliver it: the reconciler skips terminal orders and no retry path
+        // treats a failed wallet purchase as re-dispatchable.
         await createOrderRecord(userId, {
           userId,
           reference,
@@ -2194,16 +2367,22 @@ app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, a
           provider,
           phone,
           status: "failed",
-          refunded: true,
+          // Not "refunded": nothing was ever taken, so there is nothing to
+          // refund. Saying otherwise would double-count in the money reports.
+          refunded: false,
+          paymentStatus: releaseFailed ? "wallet_hold_stuck" : "wallet_not_charged",
+          retryEligible: false,
+          providerAttempts: error?.providerAttempts || [],
           errorMessage: error.message,
           createdAt: Date.now(),
         }).catch((orderError) => {
           logger.error("Failed to store failed order record", orderError, { userId, reference })
         })
         await upsertPurchaseIntent(reference, {
-          paymentStatus: "wallet_refunded",
+          paymentStatus: releaseFailed ? "wallet_hold_stuck" : "wallet_not_charged",
           orderStatus: "failed",
           providerSubmissionStatus: "failed",
+          retryEligible: false,
           errorMessage: error?.message || "Purchase failed before provider confirmation",
         }).catch(() => null)
       }
@@ -3320,7 +3499,9 @@ app.post("/api/retry-transaction/:reference", authenticateRequest, purchaseActio
       })
     }
 
-    const provider = existingOrderLocation?.order?.provider || (await getActiveProviderForNetwork(safeNetwork))
+    // Starts at whoever originally took the order, then moves down the route as
+    // the failover loop below tries each candidate.
+    let provider = existingOrderLocation?.order?.provider || (await getActiveProviderForNetwork(safeNetwork))
     retryProvider = provider
     retryNetwork = safeNetwork
     retryPhone = safePhone
@@ -3379,14 +3560,64 @@ app.post("/api/retry-transaction/:reference", authenticateRequest, purchaseActio
     const retryAttempt = Number(existingOrderLocation?.order?.sync?.attempts || 0) + 1
     const providerIdempotencyKey = `${reference}:retry:${retryAttempt}`
 
-    const providerResult = await getProviderAdapter(provider).purchase({
-      network: safeNetwork,
-      phone: safePhone,
-      reference,
-      catalogEntry,
-      amount: paymentData.amount / 100,
-      providerIdempotencyKey,
-    })
+    // The retry walks the same route a fresh purchase would, starting from the
+    // provider this order was originally placed with. A definitive refusal moves
+    // to the next provider; an uncertain one stops the chain and is handled by
+    // the catch below, which keeps the order pending rather than re-dispatching
+    // something that may already be live.
+    const { candidates: retryCandidates } = await resolvePurchaseProviderCandidates(safeNetwork, catalogEntry)
+    const orderedRetryCandidates = [
+      ...retryCandidates.filter((candidate) => candidate.provider === provider),
+      ...retryCandidates.filter((candidate) => candidate.provider !== provider),
+    ]
+
+    if (!orderedRetryCandidates.length) {
+      return res.status(503).json({
+        status: "error",
+        errorCode: "NO_PROVIDER_ROUTED",
+        message: "No provider is currently able to fulfil this order.",
+        timestamp: new Date().toISOString(),
+      })
+    }
+
+    let providerResult = null
+    let retryFailure = null
+
+    for (const [index, candidate] of orderedRetryCandidates.entries()) {
+      provider = candidate.provider
+      retryProvider = provider
+      try {
+        providerResult = await getProviderAdapter(provider).purchase({
+          network: safeNetwork,
+          phone: safePhone,
+          reference,
+          catalogEntry,
+          amount: paymentData.amount / 100,
+          providerIdempotencyKey,
+          hasNextProvider: hasCandidateAfter(orderedRetryCandidates, index),
+        })
+        break
+      } catch (error) {
+        if (isIndeterminateProviderSubmissionError(error)) {
+          throw error
+        }
+
+        logger.warn("Provider refused a retry", {
+          reference,
+          provider,
+          errorCode: getErrorCode(error),
+          remaining: orderedRetryCandidates.length - index - 1,
+        })
+        retryFailure = preferInformativeProviderFailure(retryFailure, error)
+      }
+    }
+
+    if (!providerResult) {
+      throw (
+        retryFailure ||
+        createAppError("PROVIDER_PURCHASE_FAILED", { providerMessage: "No provider accepted this retry." })
+      )
+    }
 
     const storedProviderOrderNumber = resolveStoredProviderOrderNumber(
       provider,

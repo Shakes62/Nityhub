@@ -20,6 +20,7 @@ import { createAppError, getErrorCode, parseJsonText } from "./lib/errors.js"
 import {
   isIndeterminateProviderSubmissionError,
   getIndeterminateProviderSubmissionMessage,
+  preferInformativeProviderFailure,
 } from "./lib/provider-failure.js"
 import {
   fetchWithRetry,
@@ -2020,6 +2021,7 @@ export {
   getProviderErrorMessage,
   isIndeterminateProviderSubmissionError,
   getIndeterminateProviderSubmissionMessage,
+  preferInformativeProviderFailure,
   reconciliationInFlight,
   getOrderSyncBackoffDelay,
   acquireOrderSyncLease,

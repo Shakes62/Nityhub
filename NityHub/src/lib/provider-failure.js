@@ -52,6 +52,45 @@ export function isIndeterminateProviderSubmissionError(error) {
   return false
 }
 
+/**
+ * Failures that say nothing about why an order was refused.
+ *
+ * These come from a provider that never got as far as looking at the order, so
+ * they must not become the reported reason when an earlier provider gave a real
+ * one ("insufficient balance", "invalid recipient").
+ */
+const UNINFORMATIVE_FAILURE_CODES = new Set([
+  "PROVIDER_CONFIGURATION_MISSING",
+  "PACKAGE_PROVIDER_MAPPING_MISSING",
+  "UNSUPPORTED_PROVIDER",
+])
+
+/**
+ * Keep the most useful failure across a failover chain.
+ *
+ * Without this, a trailing candidate that never left the ground - an
+ * unconfigured slot, an open circuit breaker - overwrites the real refusal from
+ * the provider that actually rejected the order, and every failed purchase
+ * reports the same uninformative reason.
+ *
+ * This only affects what is REPORTED. It cannot change whether money moves,
+ * because an uncertain outcome stops the chain before any later candidate runs.
+ */
+export function preferInformativeProviderFailure(previous, attempt) {
+  if (!attempt) {
+    return previous
+  }
+  if (!previous) {
+    return attempt
+  }
+
+  const upstreamCode = String(attempt?.upstreamCode || "").trim().toUpperCase()
+  const uninformative =
+    UNINFORMATIVE_FAILURE_CODES.has(getErrorCode(attempt)) || upstreamCode === "CIRCUIT_OPEN"
+
+  return uninformative ? previous : attempt
+}
+
 export function getIndeterminateProviderSubmissionMessage(provider = "") {
   const normalized = normalizeProvider(provider)
   const providerLabel =
