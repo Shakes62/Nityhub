@@ -62,8 +62,13 @@ export interface Order {
   label?: string;
   amount?: number;
   status?: string;
+  statusDescription?: string;
+  isGuest?: boolean;
+  storefrontSlug?: string;
+  paymentStatus?: string;
   timestamp?: number;
   createdAt?: number;
+  updatedAt?: number;
 }
 
 /** GET /api/me/dashboard */

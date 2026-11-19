@@ -97,18 +97,17 @@ test("a bare error with nothing on it refunds rather than stranding money", () =
 
 /* ---------------------------------- Copy ---------------------------------- */
 
-test("each provider is named in the pending message", () => {
-  assert.match(getIndeterminateProviderSubmissionMessage("pbmhub"), /^PBM HUB /)
-  assert.match(getIndeterminateProviderSubmissionMessage("godsway"), /^CK-Godsway /)
-  assert.match(getIndeterminateProviderSubmissionMessage("hubnet"), /^Hubnet /)
-  assert.match(getIndeterminateProviderSubmissionMessage("gigshub"), /^GiGSHUB /)
+test("pending messages do not expose provider identities", () => {
+  const messages = ["pbmhub", "godsway", "hubnet", "gigshub"].map(getIndeterminateProviderSubmissionMessage)
+  assert.equal(new Set(messages).size, 1)
+  assert.doesNotMatch(messages[0], /pbm|godsway|hubnet|gigshub/i)
 })
 
 test("an unknown provider degrades to a generic label instead of throwing", () => {
-  assert.match(getIndeterminateProviderSubmissionMessage("nope"), /^provider /)
-  assert.match(getIndeterminateProviderSubmissionMessage(""), /^provider /)
+  assert.match(getIndeterminateProviderSubmissionMessage("nope"), /^We have not received/)
+  assert.match(getIndeterminateProviderSubmissionMessage(""), /^We have not received/)
 })
 
 test("the pending message tells the operator not to retry", () => {
-  assert.match(getIndeterminateProviderSubmissionMessage("pbmhub"), /Do not retry/)
+  assert.match(getIndeterminateProviderSubmissionMessage("pbmhub"), /before trying again/)
 })

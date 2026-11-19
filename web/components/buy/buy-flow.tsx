@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
 import { ArrowLeft, ArrowRight, CheckCircle2, Wallet } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { formatMoney, normalizePhone } from "@/lib/format";
@@ -12,20 +13,29 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState, ErrorState } from "@/components/ui/states";
 import { Receipt, type ReceiptData } from "@/components/receipt/receipt";
 import { NetworkCard } from "@/components/buy/network-card";
+import { DeliveryEstimate } from "@/components/buy/delivery-estimate";
+import type { DeliveryEstimate as Estimate } from "@/types/engagement";
+import { errorMessage } from "@/lib/errors";
 import { networkTheme, type NetworkOption } from "@/constants/networks";
 import type { DataPackage } from "@/types/models";
+import { ApiError } from "@/types/api";
 
 type Step = "network" | "package" | "phone" | "confirm" | "receipt";
 
 export interface PurchaseResult {
   reference: string;
   message?: string;
+  orderStatus?: string;
+  balance?: number | null;
+  amount?: number;
 }
 
 interface BuyFlowProps {
   open: boolean;
   onClose: () => void;
   networks: NetworkOption[];
+  /** Per-network delivery estimates from the server. */
+  estimates?: Record<string, Estimate>;
   /** When set, the flow opens straight at that network's packages. */
   initialNetwork?: string;
   walletBalance: number | null;
@@ -63,6 +73,7 @@ export function BuyFlow({
   open,
   onClose,
   networks,
+  estimates,
   initialNetwork = "",
   walletBalance,
   loadPackages,
@@ -89,6 +100,7 @@ export function BuyFlow({
   const detected = detectNetwork(phone);
   const mismatch = detected && detected !== network;
   const insufficient = walletBalance != null && walletBalance < total;
+  const estimate: Estimate = estimates?.[network] ?? { label: "Usually 5–15 min", tone: "standard", measured: false, samples: 0 };
 
   const openPackages = useCallback(
     async (net: string) => {
@@ -101,7 +113,7 @@ export function BuyFlow({
         setPackages(await loadPackages(net));
       } catch (err) {
         setPackages([]);
-        setPkgError(err instanceof Error ? err.message : "Failed to load packages.");
+        setPkgError(errorMessage(err, "Bundles could not be loaded. Please try again."));
       } finally {
         setLoadingPkgs(false);
       }
@@ -123,7 +135,7 @@ export function BuyFlow({
       } catch (err) {
         if (!active) return;
         setPackages([]);
-        setPkgError(err instanceof Error ? err.message : "Failed to load packages.");
+        setPkgError(errorMessage(err, "Bundles could not be loaded. Please try again."));
       } finally {
         if (active) setLoadingPkgs(false);
       }
@@ -161,42 +173,66 @@ export function BuyFlow({
       });
       setReceipt({
         kind: "purchase",
-        status: "success",
+        status: result.orderStatus === "delivered" ? "success" : "pending",
         title: "Purchase receipt",
         reference: result.reference,
         date: Date.now(),
-        lines: baseLines,
-        amount: price,
+        lines: result.message ? [...baseLines, { label: "Status", value: result.message }] : baseLines,
+        amount: result.amount ?? price,
         charges: 0,
-        total,
+        total: result.amount ?? total,
         method: "Wallet",
         balanceBefore: before,
-        balanceAfter: before != null ? Math.max(0, before - total) : null,
-        estimatedDelivery: "Usually within a few minutes",
+        balanceAfter: result.balance ?? null,
+        estimatedDelivery: result.orderStatus === "delivered" ? "Delivered" : estimate.label,
         note: `${selected.label} to ${normalized} (${networkLabel})`,
       });
       setStep("receipt");
       onCompleted();
     } catch (err) {
+      const errPayload = err instanceof ApiError ? (err.payload as Record<string, unknown> | null) : null;
+      const errorRef = (errPayload?.reference || (errPayload?.data as Record<string, unknown> | undefined)?.reference) as string | undefined;
+      const statusUnknown = !(err instanceof ApiError) || err.status === 0 || err.status === 409 || err.status >= 500;
       setReceipt({
         kind: "purchase",
-        status: "failed",
+        status: statusUnknown ? "pending" : "failed",
         title: "Purchase receipt",
-        reference: `FAILED-${Date.now()}`,
+        reference: errorRef || "Unavailable",
         date: Date.now(),
         lines: [
           ...baseLines,
-          { label: "Reason", value: err instanceof Error ? err.message : "Purchase failed" },
+          {
+            label: statusUnknown ? "Next step" : "Reason",
+            value: statusUnknown
+              ? "Check your orders before trying again. The purchase may still be processing."
+              : errorMessage(err, "This purchase could not be completed."),
+          },
+          ...(errorRef
+            ? [
+                {
+                  label: "Self-service",
+                  value: (
+                    <Link
+                      href={`/repair?reference=${encodeURIComponent(errorRef)}`}
+                      className="font-medium text-brand underline"
+                    >
+                      Check & repair order
+                    </Link>
+                  ),
+                },
+              ]
+            : []),
         ],
         amount: price,
         charges: 0,
         total,
         method: "Wallet",
         balanceBefore: before,
-        balanceAfter: before,
+        balanceAfter: statusUnknown ? null : before,
         note: `${selected.label} to ${normalized} (${networkLabel})`,
       });
       setStep("receipt");
+      if (statusUnknown) onCompleted();
     } finally {
       setSubmitting(false);
     }
@@ -319,7 +355,9 @@ export function BuyFlow({
           <span className="text-sm font-semibold text-ink">{networkLabel}</span>
           {selected ? (
             <span className="ml-auto text-sm font-semibold tabular text-ink">{selected.label}</span>
-          ) : null}
+          ) : (
+            <DeliveryEstimate estimate={estimate} className="ml-auto" />
+          )}
         </div>
       ) : null}
 
@@ -327,7 +365,7 @@ export function BuyFlow({
       {step === "network" ? (
         <div className="grid grid-cols-1 gap-2">
           {networks.map((n) => (
-            <NetworkCard key={n.value} network={n} onSelect={openPackages} />
+            <NetworkCard key={n.value} network={n} onSelect={openPackages} estimate={estimates?.[n.value]} />
           ))}
         </div>
       ) : null}
@@ -437,6 +475,10 @@ export function BuyFlow({
             <div className="flex items-center justify-between gap-4 py-1.5">
               <dt className="text-xs text-muted">Beneficiary</dt>
               <dd className="font-mono text-sm text-ink">{normalized}</dd>
+            </div>
+            <div className="flex items-center justify-between gap-4 py-1.5">
+              <dt className="text-xs text-muted">Delivery</dt>
+              <dd><DeliveryEstimate estimate={estimate} /></dd>
             </div>
           </dl>
           <dl className="rounded-lg border border-border px-4 py-2">

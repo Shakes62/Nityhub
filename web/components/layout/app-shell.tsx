@@ -7,6 +7,7 @@ import { cn } from "@/lib/cn";
 import { useAuth } from "@/contexts/auth-context";
 import { getUserProfile } from "@/services/api";
 import { Sidebar } from "@/components/layout/sidebar";
+import { NotificationBell } from "@/components/layout/notification-bell";
 
 /**
  * Authenticated application shell: guards the route (redirecting signed-out
@@ -107,12 +108,16 @@ export function AppShell({ children }: { children: ReactNode }) {
           <Menu className="size-6" />
         </button>
         <span className="font-semibold text-ink">NityHub</span>
-        <span className="ml-auto max-w-[45%] truncate text-sm text-muted">
+        <span className="ml-auto max-w-[40%] truncate text-sm text-muted">
           {displayName}
         </span>
+        <NotificationBell />
       </header>
 
       <div className="mx-auto flex min-h-screen w-full max-w-5xl flex-col px-4 py-6 sm:px-6 lg:py-8">
+        <div className="-mb-3 hidden justify-end lg:flex">
+          <NotificationBell />
+        </div>
         <main className="stagger-children flex flex-1 flex-col gap-5">{children}</main>
         <footer className="mt-8 border-t border-border pt-5 text-center text-xs text-muted">
           <span className="font-medium text-ink-soft">NityHub</span> · Reliable data

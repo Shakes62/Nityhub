@@ -21,10 +21,18 @@ import {
   getAdminPackages,
   getProviderHealth,
   getProviderRouting,
+  getVendingControls,
+  updateVendingControls,
+  resetProviderDispatch,
+  getProviderCosts,
+  updateProviderCosts,
   updateAdminPackages,
   updateProviderRouting,
 } from "@/services/admin";
+import type { VendingControls } from "@/services/admin";
 import { formatDate } from "@/lib/format";
+
+const providerAlias: Record<string, string> = { hubnet: "Provider A", godsway: "Provider B", gigshub: "Provider C", pbmhub: "Provider D" };
 
 /* --------------------------- Editable package row -------------------------- */
 
@@ -158,6 +166,12 @@ export default function AdminCatalogPage() {
   const packagesQuery = useAsyncData(() => getAdminPackages(network), [network]);
   const routingQuery = useAsyncData(getProviderRouting, []);
   const healthQuery = useAsyncData(getProviderHealth, []);
+  const controlsQuery = useAsyncData(getVendingControls, []);
+  const costsQuery = useAsyncData(() => getProviderCosts(network), [network]);
+  const [controlsDraft, setControlsDraft] = useState<VendingControls | null>(null);
+  const [costsDraft, setCostsDraft] = useState<Record<string, Record<string, number>>>({});
+  const [savingControls, setSavingControls] = useState(false);
+  const [savingCosts, setSavingCosts] = useState(false);
 
   const [rows, setRows] = useState<EditRow[]>([]);
   const [savingPackages, setSavingPackages] = useState(false);
@@ -188,6 +202,20 @@ export default function AdminCatalogPage() {
       setRoutingDraft({ ...routingQuery.data.routing });
     }
   }, [routingQuery.data]);
+
+  useEffect(() => {
+    if (controlsQuery.data) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setControlsDraft(controlsQuery.data);
+    }
+  }, [controlsQuery.data]);
+
+  useEffect(() => {
+    if (costsQuery.data) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setCostsDraft(costsQuery.data);
+    }
+  }, [costsQuery.data]);
 
   const activeProvider = packagesQuery.data?.activeProvider || "";
 
@@ -345,6 +373,38 @@ export default function AdminCatalogPage() {
         }
       />
 
+      <Card className="flex flex-col gap-4">
+        <CardHeader title="Vending switchboard" description="Pause purchases immediately across the platform or for a network. Pricing protection applies at dispatch." />
+        {controlsQuery.error ? <ErrorState message={controlsQuery.error} onRetry={controlsQuery.reload} /> : controlsDraft ? (
+          <>
+            <label className="flex items-center gap-2 text-sm text-ink"><input type="checkbox" checked={controlsDraft.enabled} onChange={(e) => setControlsDraft({ ...controlsDraft, enabled: e.target.checked })} /> Platform vending active</label>
+            <label className="flex items-start gap-2 text-sm text-ink">
+              <input type="checkbox" className="mt-1" checked={controlsDraft.requireProviderCosts === true} onChange={(e) => setControlsDraft({ ...controlsDraft, requireProviderCosts: e.target.checked })} />
+              <span>
+                Require provider costs
+                <span className="block text-xs text-muted">When on, a package is only sold on a provider whose wholesale cost is recorded below. When off, recorded costs are still enforced and packages without one keep selling.</span>
+              </span>
+            </label>
+            <div className="grid gap-3 sm:grid-cols-3">
+              {ADMIN_NETWORKS.map((net) => (
+                <Field key={net} label={`${net.toUpperCase()} availability`} htmlFor={`availability-${net}`}>
+                  <Select id={`availability-${net}`} value={controlsDraft.networks[net] || "active"} onChange={(e) => setControlsDraft({ ...controlsDraft, networks: { ...controlsDraft.networks, [net]: e.target.value as "active" | "maintenance" } })}>
+                    <option value="active">Active</option><option value="maintenance">Maintenance</option>
+                  </Select>
+                </Field>
+              ))}
+            </div>
+            <Field label="Minimum margin (GHS)" htmlFor="minimum-margin"><Input id="minimum-margin" type="number" min="0" step="0.01" value={controlsDraft.minimumMargin} onChange={(e) => setControlsDraft({ ...controlsDraft, minimumMargin: Number(e.target.value) })} /></Field>
+            <Button size="sm" loading={savingControls} onClick={async () => {
+              setSavingControls(true);
+              try { setControlsDraft(await updateVendingControls(controlsDraft)); toast.success("Vending controls saved"); }
+              catch (err) { toast.error(err instanceof Error ? err.message : "Could not save controls"); }
+              finally { setSavingControls(false); }
+            }}><Save className="size-4" />Save controls</Button>
+          </>
+        ) : <Skeleton className="h-20 rounded-lg" />}
+      </Card>
+
       {/* Provider routing */}
       <Card className="flex flex-col gap-4">
         <CardHeader
@@ -395,7 +455,7 @@ export default function AdminCatalogPage() {
                               (p) => p === selected || !route.includes(p),
                             ).map((p) => (
                               <option key={p} value={p}>
-                                {p}
+                                {providerAlias[p]}
                               </option>
                             ))}
                           </Select>
@@ -404,11 +464,11 @@ export default function AdminCatalogPage() {
                     </div>
                     {route.length > 1 ? (
                       <p className="mt-2 text-xs text-muted">
-                        Falls back to {route.slice(1).join(" → ")}
+                        Falls back to {route.slice(1).map((p) => providerAlias[p]).join(" → ")}
                       </p>
                     ) : (
                       <p className="mt-2 text-xs text-warning">
-                        No failover — if {route[0] || "this provider"} refuses, the order fails.
+                        No failover — if {providerAlias[route[0]] || "this provider"} refuses, the order fails.
                       </p>
                     )}
                   </div>
@@ -426,6 +486,36 @@ export default function AdminCatalogPage() {
                 Save routing
               </Button>
             </div>
+          </>
+        )}
+      </Card>
+
+      <Card className="flex flex-col gap-4">
+        <CardHeader title="Provider costs" description={`Wholesale costs for ${network.toUpperCase()}. A sale is refused when the buyer price is below cost plus the minimum margin${controlsDraft?.requireProviderCosts ? ", or when no cost is recorded (strict mode is on)" : ""}.`} />
+        {costsQuery.error ? <ErrorState message={costsQuery.error} onRetry={costsQuery.reload} /> : costsQuery.loading && !costsQuery.data ? <Skeleton className="h-20 rounded-lg" /> : (
+          <>
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              {rows.filter((row) => row.id && row.enabled).flatMap((row) => ADMIN_PROVIDERS.map((provider) => (
+                <Field key={`${row.id}-${provider}`} label={`${row.label || row.id} · ${providerAlias[provider]}`} htmlFor={`cost-${row.id}-${provider}`}
+                  hint={costsDraft[row.id]?.[provider] == null && routingDraft[network]?.includes(provider) ? (controlsDraft?.requireProviderCosts ? "Missing: not sold on this provider" : "Not recorded") : undefined}>
+                  <Input id={`cost-${row.id}-${provider}`} type="number" min="0" step="0.01" placeholder="Cost (GHS)" value={costsDraft[row.id]?.[provider] ?? ""} onChange={(e) => setCostsDraft((prev) => {
+                    const next = { ...prev[row.id] };
+                    if (e.target.value === "") delete next[provider];
+                    else next[provider] = Number(e.target.value);
+                    return { ...prev, [row.id]: next };
+                  })} />
+                </Field>
+              )))}
+            </div>
+            <Button size="sm" loading={savingCosts} onClick={async () => {
+              setSavingCosts(true);
+              try {
+                await updateProviderCosts(network, costsDraft);
+                await costsQuery.reload();
+                toast.success("Provider costs saved");
+              } catch (err) { toast.error(err instanceof Error ? err.message : "Could not save costs"); }
+              finally { setSavingCosts(false); }
+            }}><Save className="size-4" />Save costs</Button>
           </>
         )}
       </Card>
@@ -455,7 +545,7 @@ export default function AdminCatalogPage() {
 
         {activeProvider ? (
           <p className="text-xs text-muted">
-            Active provider for {network.toUpperCase()}: <span className="font-medium text-ink-soft capitalize">{activeProvider}</span>
+            Active provider for {network.toUpperCase()}: <span className="font-medium text-ink-soft capitalize">{providerAlias[activeProvider] || "Provider"}</span>
           </p>
         ) : null}
 
@@ -499,11 +589,11 @@ export default function AdminCatalogPage() {
                       const mappingBadge = r.mappingDirty
                         ? { tone: "info" as const, text: "Edited", title: "Save the catalog to verify this mapping" }
                         : r.mappingMissing.length === 0
-                          ? { tone: "success" as const, text: "Mapped", title: `Complete for ${activeProvider}` }
+                          ? { tone: "success" as const, text: "Mapped", title: `Complete for ${providerAlias[activeProvider] || "provider"}` }
                           : {
                               tone: "warning" as const,
                               text: `Missing ${r.mappingMissing.join(", ")}`,
-                              title: `${activeProvider} needs ${r.mappingMissing.join(" and ")} — click to set`,
+                              title: `${providerAlias[activeProvider] || "Provider"} needs ${r.mappingMissing.join(" and ")} — click to set`,
                             };
                       return (
                         <tr key={r._key}>
@@ -642,8 +732,33 @@ export default function AdminCatalogPage() {
           <div className="grid gap-3 md:grid-cols-3">
             {Object.entries(healthQuery.data?.providers ?? {}).map(([provider, info]) => (
               <div key={provider} className="rounded-lg border border-border bg-surface-soft p-4">
-                <p className="mb-2 text-sm font-semibold capitalize text-ink">{provider}</p>
+                <p className="mb-2 text-sm font-semibold capitalize text-ink">{providerAlias[provider]}</p>
                 <HealthEntries data={info as Record<string, unknown>} />
+              </div>
+            ))}
+            {Object.entries((healthQuery.data?.dispatch ?? {}) as Record<string, { state: string; attempts: number; healthRate: number | null; cooldownUntil: number }>).map(([provider, info]) => (
+              <div key={`dispatch-${provider}`} className="flex flex-col gap-2 rounded-lg border border-border p-4">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-sm font-semibold text-ink">{providerAlias[provider] || "Provider"} dispatch</p>
+                  <Badge tone={info.state === "cooldown" ? "danger" : info.state === "probing" ? "warning" : "success"}>
+                    {info.state === "cooldown" ? "Cooling down" : info.state === "probing" ? "Probing" : "Available"}
+                  </Badge>
+                </div>
+                <p className="text-xs text-muted">
+                  {info.attempts ? `${Math.round((info.healthRate ?? 0) * 100)}% success over ${info.attempts} recent attempts` : "No recent attempts"}
+                  {info.state === "cooldown" && info.cooldownUntil ? ` · resumes ${formatDate(info.cooldownUntil)}` : ""}
+                </p>
+                {info.state !== "available" ? (
+                  <Button size="sm" variant="secondary" className="self-start" onClick={async () => {
+                    try {
+                      await resetProviderDispatch(provider);
+                      toast.success("Provider back in rotation");
+                      void healthQuery.reload();
+                    } catch (err) {
+                      toast.error(err instanceof Error ? err.message : "Could not reset provider");
+                    }
+                  }}>Return to rotation</Button>
+                ) : null}
               </div>
             ))}
             {healthQuery.data?.sync ? (
@@ -692,7 +807,7 @@ export default function AdminCatalogPage() {
                     className={`rounded-lg border p-3 ${isPrimary ? "border-brand/50 bg-brand-soft/30" : "border-border"}`}
                   >
                     <p className="mb-2 flex items-center gap-2 text-sm font-medium capitalize text-ink">
-                      {provider}
+                      {providerAlias[provider]}
                       {isPrimary ? <Badge tone="success">Primary — sets the shop price</Badge> : null}
                     </p>
                     <div className="grid gap-3 sm:grid-cols-2">
@@ -752,7 +867,7 @@ export default function AdminCatalogPage() {
         title="Provider mapping"
         description={
           activeProvider
-            ? `What ${activeProvider} needs to fulfil this package on ${network.toUpperCase()}.`
+            ? `What ${providerAlias[activeProvider] || "provider"} needs to fulfil this package on ${network.toUpperCase()}.`
             : "Values used by the upstream provider."
         }
         size="lg"

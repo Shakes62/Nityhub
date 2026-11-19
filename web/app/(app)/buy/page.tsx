@@ -4,36 +4,42 @@ import { useCallback, useEffect, useState } from "react";
 import { formatMoney } from "@/lib/format";
 import { NETWORKS } from "@/constants/networks";
 import type { DataPackage } from "@/types/models";
-import { getPackages, getWalletBalance, walletPurchase } from "@/services/api";
+import { estimateFor, getPackages, getWalletBalance, walletPurchase } from "@/services/api";
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
 import { PageHero } from "@/components/layout/page-hero";
 import { BuyFlow, type PurchaseResult } from "@/components/buy/buy-flow";
 import { NetworkCard } from "@/components/buy/network-card";
+import { BannerCarousel } from "@/components/banners/banner-carousel";
+import { DeliveryTicker } from "@/components/social-proof/delivery-ticker";
+import { useNetworkAvailability } from "@/hooks/use-network-availability";
+import { useLiveEvents } from "@/contexts/live-events-context";
 
 export default function BuyPage() {
-  const [wallet, setWallet] = useState<number | null>(null);
+  const [fetchedWallet, setFetchedWallet] = useState<number | null>(null);
   const [flowOpen, setFlowOpen] = useState(false);
   const [flowKey, setFlowKey] = useState(0);
   const [initialNetwork, setInitialNetwork] = useState("");
+  const { availability, loading: availabilityLoading, isOpen } = useNetworkAvailability();
+  const live = useLiveEvents();
+  // Spendable balance: the live stream wins once it has spoken, so a deposit
+  // credited by webhook shows up here without a refresh.
+  const wallet = live.wallet ? live.wallet.availableBalance : fetchedWallet;
 
   const refreshWallet = useCallback(async () => {
     try {
-      setWallet(await getWalletBalance());
+      setFetchedWallet(await getWalletBalance());
     } catch {
       /* non-fatal for the buy screen */
     }
   }, []);
 
-  // Load the opening balance. Guarded so a resolved fetch cannot set state on an
-  // unmounted page, and the write happens after the await rather than
-  // synchronously in the effect body.
   useEffect(() => {
     let active = true;
     (async () => {
       try {
         const balance = await getWalletBalance();
-        if (active) setWallet(balance);
+        if (active) setFetchedWallet(balance);
       } catch {
         /* non-fatal for the buy screen */
       }
@@ -70,9 +76,15 @@ export default function BuyPage() {
       volume?: number;
     }): Promise<PurchaseResult> => {
       const res = await walletPurchase(input);
+      if (!res.data?.reference) {
+        throw new Error("We could not confirm this purchase. Check your orders before trying again.");
+      }
       return {
-        reference: res?.data?.reference || `REF_${Date.now()}`,
+        reference: res.data.reference,
         message: res?.message,
+        orderStatus: res.data.orderStatus,
+        balance: res.data.balance,
+        amount: res.data.amount,
       };
     },
     [],
@@ -95,11 +107,27 @@ export default function BuyPage() {
         </div>
       </PageHero>
 
+      <BannerCarousel />
+
+      <DeliveryTicker />
+
       <Card className="flex flex-col gap-3 p-4">
         <h2 className="text-sm font-semibold text-ink">Choose a network</h2>
+        {availability && !availability.enabled ? (
+          <p role="status" className="rounded-lg border border-warning/30 bg-warning-soft px-3 py-2 text-sm text-warning">
+            Purchases are paused for a short maintenance. Please check back shortly.
+          </p>
+        ) : null}
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
           {NETWORKS.map((n) => (
-            <NetworkCard key={n.value} network={n} onSelect={openFlow} />
+            <NetworkCard
+              key={n.value}
+              network={n}
+              onSelect={openFlow}
+              loading={availabilityLoading}
+              paused={!availabilityLoading && !isOpen(n.value)}
+              estimate={estimateFor(availability, n.value)}
+            />
           ))}
         </div>
       </Card>
@@ -108,7 +136,8 @@ export default function BuyPage() {
         key={flowKey}
         open={flowOpen}
         onClose={() => setFlowOpen(false)}
-        networks={NETWORKS}
+        networks={NETWORKS.filter((n) => isOpen(n.value))}
+        estimates={availability?.estimates}
         initialNetwork={initialNetwork}
         walletBalance={wallet}
         loadPackages={loadFlowPackages}

@@ -12,6 +12,7 @@ import { Field, Input } from "@/components/ui/field";
 import { PageHero } from "@/components/layout/page-hero";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ErrorState } from "@/components/ui/states";
+import { PushOptIn } from "@/components/pwa/push-opt-in";
 
 async function loadAccount() {
   const [profile, balance] = await Promise.all([
@@ -155,6 +156,8 @@ export default function AccountPage() {
           </Card>
         </div>
       )}
+
+      <PushOptIn />
     </>
   );
 }

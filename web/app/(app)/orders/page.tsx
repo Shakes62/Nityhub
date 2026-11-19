@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import Link from "next/link";
 import { Eye, MessageCircle, Search } from "lucide-react";
 import { buttonVariants } from "@/components/ui/button";
 import { Badge, statusLabel, statusTone } from "@/components/ui/badge";
@@ -176,6 +177,8 @@ export default function OrdersPage() {
         size="sm"
         footer={
           view ? (
+            <div className="flex gap-2">
+            {view.status !== "delivered" ? <Link href={`/repair?reference=${encodeURIComponent(view.reference || "")}`} className={buttonVariants("primary", "sm")}>Check and repair</Link> : null}
             <a
               href={reportLink(view)}
               target="_blank"
@@ -185,6 +188,7 @@ export default function OrdersPage() {
               <MessageCircle className="size-3.5" aria-hidden />
               Report
             </a>
+            </div>
           ) : null
         }
       >

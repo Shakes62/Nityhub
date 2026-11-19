@@ -1,6 +1,20 @@
 import { CONFIG } from "../config.js"
 import { logger } from "../logger.js"
 import { createAppError, parseJsonText } from "./errors.js"
+import { registerCacheReset } from "./runtime-cache.js"
+
+/**
+ * Whether an error says the provider is unhealthy. A 4xx (other than 408 and
+ * 429) is a definitive, well-formed answer - "invalid recipient", "order not
+ * found" - from a provider that is working fine. Counting those used to open
+ * the breaker after three mistyped numbers or three status lookups of orders
+ * not yet submitted, blocking every customer on that provider.
+ */
+export function isProviderHealthFailure(error) {
+  const status = Number(error?.statusCode || 0)
+  if (status >= 400 && status < 500 && status !== 408 && status !== 429) return false
+  return true
+}
 
 export class CircuitBreaker {
   constructor(threshold = 3, timeout = 10000, name = "unknown") {
@@ -38,7 +52,8 @@ export class CircuitBreaker {
       this.onSuccess()
       return result
     } catch (error) {
-      this.onFailure()
+      if (isProviderHealthFailure(error)) this.onFailure()
+      else this.onSuccess()
       throw error
     }
   }
@@ -81,6 +96,15 @@ export const godswayCircuitBreaker = new CircuitBreaker(3, 15000, "godsway")
 export const gigshubCircuitBreaker = new CircuitBreaker(3, 15000, "gigshub")
 export const pbmhubCircuitBreaker = new CircuitBreaker(3, 15000, "pbmhub")
 
+registerCacheReset(() => {
+  for (const breaker of [paystackCircuitBreaker, hubnetCircuitBreaker, godswayCircuitBreaker, gigshubCircuitBreaker, pbmhubCircuitBreaker]) {
+    breaker.failureCount = 0
+    breaker.successCount = 0
+    breaker.lastFailureTime = null
+    breaker.state = "CLOSED"
+  }
+})
+
 /**
  * @param config.includeResponseMeta  Resolve to `{ data, statusCode }` instead
  *   of the bare parsed body. PBM HUB needs it: it answers a network timeout
@@ -102,11 +126,14 @@ export const fetchWithRetry = async (url, options = {}, config = {}) => {
   let lastError = null
 
   const executeRequest = async () => {
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    // A submission may have been accepted before its response was lost. Never
+    // replay a mutating request automatically, regardless of caller settings.
+    const attempts = ["POST", "PUT", "PATCH", "DELETE"].includes(String(options.method || "GET").toUpperCase())
+      ? 0 : maxRetries
+    for (let attempt = 0; attempt <= attempts; attempt++) {
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), timeout)
       try {
-        const controller = new AbortController()
-        const timeoutId = setTimeout(() => controller.abort(), timeout)
-
         const fetchOptions = {
           ...options,
           signal: controller.signal,
@@ -121,8 +148,6 @@ export const fetchWithRetry = async (url, options = {}, config = {}) => {
         logger.debug(`Making request to ${url}`, { attempt: attempt + 1, maxRetries: maxRetries + 1 })
 
         const response = await fetch(url, fetchOptions)
-        clearTimeout(timeoutId)
-
         if (!response.ok) {
           const errorText = await response.text()
           const errorData = parseJsonText(errorText, { message: errorText || `HTTP ${response.status}` })
@@ -156,6 +181,7 @@ export const fetchWithRetry = async (url, options = {}, config = {}) => {
         logger.debug(`Request successful`, { url, attempt: attempt + 1 })
         return includeResponseMeta ? { data, statusCode: response.status } : data
       } catch (error) {
+        clearTimeout(timeoutId)
         lastError = error
 
         if (error.name === "AbortError") {
@@ -166,12 +192,14 @@ export const fetchWithRetry = async (url, options = {}, config = {}) => {
 
         logger.error(`Request attempt ${attempt + 1} failed`, error, { url })
 
-        if (error.message.includes("Client error") || attempt === maxRetries) {
+        if (error.message.includes("Client error") || attempt === attempts) {
           break
         }
 
         const delay = Math.min(baseDelay * Math.pow(1.5, attempt), maxDelay)
         await new Promise((resolve) => setTimeout(resolve, delay))
+      } finally {
+        clearTimeout(timeoutId)
       }
     }
 

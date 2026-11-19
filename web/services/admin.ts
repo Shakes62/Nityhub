@@ -162,6 +162,34 @@ export async function getProviderHealth(): Promise<ProviderHealthData> {
   return res.data ?? {};
 }
 
+export interface VendingControls {
+  enabled: boolean;
+  networks: Record<string, "active" | "maintenance">;
+  minimumMargin: number;
+  /** Refuse to sell a package whose provider cost has not been recorded. */
+  requireProviderCosts: boolean;
+  updatedAt?: number;
+}
+
+export async function getVendingControls(): Promise<VendingControls> {
+  const res = await apiRequest<VendingControls>("/api/admin/vending-controls", { auth: true });
+  return res.data as VendingControls;
+}
+
+export async function updateVendingControls(value: VendingControls): Promise<VendingControls> {
+  const res = await apiRequest<VendingControls>("/api/admin/vending-controls", { method: "PUT", json: value, auth: true });
+  return res.data as VendingControls;
+}
+
+export async function getProviderCosts(network: string): Promise<Record<string, Record<string, number>>> {
+  const res = await apiRequest<Record<string, Record<string, number>>>(`/api/admin/provider-costs/${encodeURIComponent(network)}`, { auth: true });
+  return res.data ?? {};
+}
+
+export async function updateProviderCosts(network: string, costs: Record<string, Record<string, number>>): Promise<void> {
+  await apiRequest(`/api/admin/provider-costs/${encodeURIComponent(network)}`, { method: "PUT", json: { costs }, auth: true });
+}
+
 /* ---------------------------------- AFA ---------------------------------- */
 
 /**
@@ -175,4 +203,108 @@ export async function updateAfaFee(fee: number): Promise<AfaFeeResult> {
     auth: true,
   });
   return res.data as AfaFeeResult;
+}
+
+/* --------------------------------- Banners -------------------------------- */
+
+export async function getAdminBanners(): Promise<import("@/types/engagement").StoreBanner[]> {
+  const res = await apiRequest<import("@/types/engagement").StoreBanner[]>("/api/admin/banners", {
+    auth: true,
+  });
+  return Array.isArray(res.data) ? res.data : [];
+}
+
+export async function saveAdminBanner(
+  banner: Partial<import("@/types/engagement").StoreBanner>,
+): Promise<import("@/types/engagement").StoreBanner> {
+  const res = await apiRequest<import("@/types/engagement").StoreBanner>("/api/admin/banners", {
+    method: "PUT",
+    json: banner,
+    auth: true,
+  });
+  return res.data as import("@/types/engagement").StoreBanner;
+}
+
+export async function deleteAdminBanner(id: string): Promise<void> {
+  await apiRequest(`/api/admin/banners/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    auth: true,
+  });
+}
+
+/* ------------------------------- Dispatch health ------------------------------ */
+
+export async function resetProviderDispatch(provider: string): Promise<void> {
+  await apiRequest(`/api/admin/provider-health/${encodeURIComponent(provider)}/reset`, {
+    method: "POST",
+    auth: true,
+    json: {},
+  });
+}
+
+/* --------------------------------- Security -------------------------------- */
+
+export type BlacklistKind = "phone" | "identity";
+
+export interface RiskFlag {
+  id: string;
+  actor: string;
+  reason: string;
+  count: number;
+  firstAt: number;
+  lastAt: number;
+  details?: Record<string, unknown>;
+}
+
+export interface SecurityOverview {
+  blacklist: { phone: number; identity: number };
+  riskFlags: RiskFlag[];
+}
+
+export async function getSecurityOverview(): Promise<SecurityOverview> {
+  const res = await apiRequest<SecurityOverview>("/api/admin/security/overview", { auth: true });
+  return res.data ?? { blacklist: { phone: 0, identity: 0 }, riskFlags: [] };
+}
+
+export async function checkBlacklist(kind: BlacklistKind, value: string): Promise<{ blocked: boolean; note: string; updatedAt: number | null }> {
+  const res = await apiRequest<{ blocked: boolean; note: string; updatedAt: number | null }>(
+    `/api/admin/blacklist/${kind}?value=${encodeURIComponent(value)}`,
+    { auth: true },
+  );
+  return res.data ?? { blocked: false, note: "", updatedAt: null };
+}
+
+export async function setBlacklist(kind: BlacklistKind, value: string, active: boolean, note = ""): Promise<void> {
+  await apiRequest(`/api/admin/blacklist/${kind}`, { method: "PUT", auth: true, json: { value, active, note } });
+}
+
+export async function clearRiskFlag(id: string): Promise<void> {
+  await apiRequest(`/api/admin/risk-flags/${encodeURIComponent(id)}`, { method: "DELETE", auth: true });
+}
+
+/* -------------------------------- Storefronts ------------------------------- */
+
+export interface AdminStorefront {
+  slug: string;
+  name: string;
+  tagline: string;
+  whatsapp: string;
+  enabled: boolean;
+  suspended: boolean;
+  paused: boolean;
+  customDomain: string;
+  storeUrl: string;
+  ownerUid: string;
+  margins: Record<string, number>;
+  stats: { sales: number; profit: number; revenue: number };
+  createdAt: number;
+}
+
+export async function getAdminStorefronts(): Promise<AdminStorefront[]> {
+  const res = await apiRequest<AdminStorefront[]>("/api/admin/storefronts", { auth: true });
+  return Array.isArray(res.data) ? res.data : [];
+}
+
+export async function setStorefrontSuspended(slug: string, suspended: boolean): Promise<void> {
+  await apiRequest(`/api/admin/storefronts/${encodeURIComponent(slug)}`, { method: "PATCH", auth: true, json: { suspended } });
 }

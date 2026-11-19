@@ -4,6 +4,7 @@ import compression from "compression"
 import helmet from "helmet"
 import { CONFIG } from "./config.js"
 import { logger } from "./logger.js"
+import { registerCacheReset } from "./lib/runtime-cache.js"
 
 const allowedOrigins = new Set([
   CONFIG.frontendUrl,
@@ -15,10 +16,33 @@ const allowedOrigins = new Set([
   "https://www.nityhub.online",
   ...CONFIG.additionalAllowedOrigins,
 ].filter(Boolean))
+const storefrontDomain = String(process.env.STOREFRONT_BASE_DOMAIN || "").trim().toLowerCase()
+
+function isStorefrontOrigin(origin) {
+  if (!storefrontDomain) return false
+  try {
+    const url = new URL(origin)
+    const suffix = `.${storefrontDomain}`
+    const slug = url.hostname.toLowerCase().endsWith(suffix) ? url.hostname.slice(0, -suffix.length) : ""
+    return url.protocol === "https:" && /^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$/.test(slug)
+  } catch { return false }
+}
+
+// Extra synchronous origin checks registered by feature modules (custom store
+// domains live in the database, so storefronts.js owns that list).
+const originAllowances = []
+export function registerOriginAllowance(check) {
+  if (typeof check === "function") originAllowances.push(check)
+}
+function isAllowedByRegistry(origin) {
+  return originAllowances.some((check) => {
+    try { return check(origin) === true } catch { return false }
+  })
+}
 
 const corsOptions = {
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.has(origin) || CONFIG.nodeEnv === "development") {
+    if (!origin || allowedOrigins.has(origin) || isStorefrontOrigin(origin) || isAllowedByRegistry(origin) || CONFIG.nodeEnv === "development") {
       callback(null, true)
     } else {
       callback(null, false)
@@ -57,8 +81,11 @@ const securityHeaders = {
 
 export const rateLimitStore = new Map()
 export const scopedRateLimitStore = new Map()
+const publicIpWindows = new Map()
+registerCacheReset(() => { rateLimitStore.clear(); scopedRateLimitStore.clear(); publicIpWindows.clear() })
 
 function rateLimit(req, res, next) {
+  if (isRateLimitExemptPath(req.path)) return next()
   const clientId = req.ip || "unknown"
   const now = Date.now()
   const windowStart = now - CONFIG.rateLimitWindow
@@ -118,6 +145,44 @@ export const purchaseActionRateLimit = createScopedRateLimit("purchase_action", 
   max: 10,
   keyFn: (req) => req.authUser?.uid || req.ip || "unknown",
 })
+
+export const purchaseVelocityRateLimit = createScopedRateLimit("purchase_velocity", {
+  windowMs: 10 * 1000,
+  max: 3,
+  keyFn: (req) => req.authUser?.uid || req.ip || "unknown",
+})
+
+// Per-IP budget for anonymous API traffic. Writes (checkout, repair) get the
+// blueprint's 60/min. Reads get more headroom because Ghanaian mobile carriers
+// put many shoppers behind one CGNAT address, and a single storefront visit
+// already reads availability, banners, proof and a catalog.
+export const PUBLIC_WRITE_LIMIT_PER_MINUTE = 60
+export const PUBLIC_READ_LIMIT_PER_MINUTE = 240
+
+export function isRateLimitExemptPath(path) {
+  // Signature-verified provider and gateway callbacks must never be throttled:
+  // a dropped deposit webhook is a customer left waiting for their money.
+  return /^\/(?:api\/)?webhook(?:\/|$)/.test(String(path || ""))
+}
+
+function publicIpRateLimit(req, res, next) {
+  if (!req.path.startsWith("/api/") || req.headers.authorization || isRateLimitExemptPath(req.path)) return next()
+  const write = !["GET", "HEAD", "OPTIONS"].includes(req.method)
+  const key = `${write ? "w" : "r"}:${req.ip || "unknown"}`
+  const limit = write ? PUBLIC_WRITE_LIMIT_PER_MINUTE : PUBLIC_READ_LIMIT_PER_MINUTE
+  const now = Date.now()
+  const times = (publicIpWindows.get(key) || []).filter((at) => at > now - 60_000)
+  if (times.length >= limit) {
+    res.set("Retry-After", "30")
+    return res.status(429).json({ status: "error", errorCode: "RATE_LIMITED", message: "Too many requests. Please wait a moment and try again." })
+  }
+  times.push(now)
+  publicIpWindows.set(key, times)
+  if (publicIpWindows.size > 20_000) {
+    for (const [ip, entries] of publicIpWindows) if (entries.at(-1) < now - 60_000) publicIpWindows.delete(ip)
+  }
+  next()
+}
 
 export const paymentVerificationRateLimit = createScopedRateLimit("payment_verification", {
   windowMs: 60 * 1000,
@@ -255,6 +320,7 @@ export function installBaseMiddleware(app) {
   })
 
   app.use(rateLimit)
+  app.use(publicIpRateLimit)
 
   app.use(validateRequestSignature)
 }

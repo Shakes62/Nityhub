@@ -1,6 +1,4 @@
-import express from "express"
-
-import { CONFIG } from "./src/config.js"
+import { CONFIG, assertRequiredConfig } from "./src/config.js"
 import { logger } from "./src/logger.js"
 import { getErrorCode } from "./src/lib/errors.js"
 import {
@@ -8,12 +6,8 @@ import {
   duplicateAttempts,
   DUPLICATE_ATTEMPT_WINDOW,
 } from "./src/state.js"
-import {
-  installBaseMiddleware,
-  rateLimitStore,
-  scopedRateLimitStore,
-} from "./src/middleware.js"
-import { registerRoutes } from "./src/routes.js"
+import { rateLimitStore, scopedRateLimitStore } from "./src/middleware.js"
+import { createApp } from "./src/app.js"
 import {
   normalizeCatalogPackages,
   ensureProviderRoutingSettings,
@@ -24,12 +18,12 @@ import {
 } from "./src/domain.js"
 import { runOrderStatusReconciliation } from "./src/providers-sync.js"
 import { runRefundQueue } from "./src/refund-queue.js"
+import { runRepairNotificationQueue } from "./src/repair-notifications.js"
+import { runFulfillmentQueue } from "./src/fulfillment-queue.js"
 
-const app = express()
-app.disable("x-powered-by")
+assertRequiredConfig()
 
-installBaseMiddleware(app)
-registerRoutes(app)
+const app = createApp()
 
 // Enhanced cleanup with better error handling
 setInterval(() => {
@@ -130,6 +124,20 @@ setTimeout(() => {
     logger.error("Initial refund queue sweep failed", error)
   })
 }, 10000)
+
+setInterval(() => {
+  runRepairNotificationQueue().catch((error) => logger.error("Repair notification sweep failed", error))
+}, 30_000)
+
+setTimeout(() => {
+  runRepairNotificationQueue().catch((error) => logger.error("Initial repair notification sweep failed", error))
+}, 6000)
+
+// Safety net for buyers who paid and closed the tab: fulfils paid bundle orders
+// that no browser ever came back to confirm. See src/fulfillment-queue.js.
+setInterval(() => {
+  runFulfillmentQueue().catch((error) => logger.error("Fulfillment queue sweep failed", error))
+}, 20_000)
 
 const server = app.listen(CONFIG.port, "0.0.0.0", () => {
   logger.info(`🚀 DataWise API Server v5.0 running on port ${CONFIG.port}`)

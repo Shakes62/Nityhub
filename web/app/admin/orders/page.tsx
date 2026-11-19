@@ -178,6 +178,7 @@ export default function AdminOrdersPage() {
                         <Badge tone={statusTone(o.status)} dot>
                           {statusLabel(o.status)}
                         </Badge>
+                        {o.commercialReview ? <Badge tone="warning">Pricing review</Badge> : null}
                       </Td>
                       <Td className="max-w-[14rem]">
                         {o.providerStatusDescription || o.providerStatusRaw ? (

@@ -1767,7 +1767,7 @@ async function claimIdempotencyKey(scope, key, payload = {}, windowMs = CONFIG.i
 
   await ref.transaction((current) => {
     const value = current && typeof current === "object" ? current : {}
-    if (Number(value.expiresAt || 0) > now) {
+    if (Number(value.expiresAt || 0) > now && value.status !== "failed") {
       existing = value
       return
     }
@@ -1804,7 +1804,7 @@ function isPurchaseIntentActivelyProcessing(intent = {}) {
   const submissionStatus = String(intent?.providerSubmissionStatus || "").trim().toLowerCase()
   const paymentStatus = String(intent?.paymentStatus || "").trim().toLowerCase()
 
-  if (["failed", "wallet_refunded", "refunded"].includes(paymentStatus)) {
+  if (["failed", "wallet_refunded", "refunded", "wallet_not_charged", "wallet_hold_stuck"].includes(paymentStatus)) {
     return false
   }
 
@@ -1935,7 +1935,9 @@ function isValidWebhookToken(token) {
 
 async function authenticateRequest(req, res, next) {
   const authHeader = String(req.headers.authorization || "")
-  if (!authHeader.startsWith("Bearer ")) {
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice("Bearer ".length).trim() : ""
+
+  if (!token) {
     return res.status(401).json({
       status: "error",
       message: "Authentication required",
@@ -1944,7 +1946,6 @@ async function authenticateRequest(req, res, next) {
   }
 
   try {
-    const token = authHeader.slice("Bearer ".length).trim()
     req.authUser = await admin.auth().verifyIdToken(token)
     next()
   } catch (error) {
@@ -1969,12 +1970,13 @@ async function authenticateRequest(req, res, next) {
  */
 async function optionalAuthenticateRequest(req, res, next) {
   const authHeader = String(req.headers.authorization || "")
-  if (!authHeader.startsWith("Bearer ")) {
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice("Bearer ".length).trim() : ""
+
+  if (!token) {
     return next()
   }
 
   try {
-    const token = authHeader.slice("Bearer ".length).trim()
     req.authUser = await admin.auth().verifyIdToken(token)
   } catch (error) {
     logger.debug("Optional token verification failed; continuing anonymously", {
@@ -2473,10 +2475,13 @@ function toPublicOrderRecord(order = {}) {
     volume: normalized.volume || 0,
     amount: toMoneyNumber(normalized.amount, 0),
     status: normalized.status,
-    statusDescription: normalized.providerStatusDescription || "",
+    statusDescription: normalized.status === "delivered" ? "Delivered" : normalized.status === "failed" ? "Delivery could not be completed" : "Your order is being processed",
     paymentStatus: normalized.paymentStatus || "",
+    isGuest: normalized.isGuest === true,
+    storefrontSlug: normalized.storefrontSlug || "",
     createdAt: normalized.createdAt,
     updatedAt: normalized.updatedAt,
+    deliveredAt: Number(normalized.deliveredAt || 0) || null,
     timestamp: normalized.timestamp,
   }
 }
@@ -2785,6 +2790,29 @@ async function findOrderLocationByLookupValue(lookupValue, { includeOrder = fals
   return await findOrderLocationByProviderLookup(lookupValue, { includeOrder, provider })
 }
 
+/**
+ * Side effects that must run exactly when an order first becomes delivered,
+ * whichever path got it there (provider webhook, status poll, repair, admin).
+ * Registered by feature modules so this file does not import them.
+ */
+const orderDeliveredHooks = []
+
+function registerOrderDeliveredHook(handler) {
+  if (typeof handler === "function") orderDeliveredHooks.push(handler)
+}
+
+async function emitOrderDelivered(previousStatus, order, location = {}) {
+  if (normalizeInternalOrderStatus(order?.status, "") !== "delivered") return
+  if (normalizeInternalOrderStatus(previousStatus, "") === "delivered") return
+  for (const handler of orderDeliveredHooks) {
+    try {
+      await handler(order, location)
+    } catch (error) {
+      logger.error("Order delivered hook failed", error, { reference: order?.reference })
+    }
+  }
+}
+
 async function createOrderRecord(uid, payload) {
   const orderRef = db.ref(`orders/${uid}`).push()
   const record = normalizeStoredOrderRecord({
@@ -2801,6 +2829,7 @@ async function createOrderRecord(uid, payload) {
     status: record.status,
   })
   await syncProviderOrderLookupIndexes({}, record, { userId: uid, orderId: orderRef.key })
+  await emitOrderDelivered("", record, { userId: uid, orderId: orderRef.key })
   return { id: orderRef.key, ...record }
 }
 
@@ -2824,6 +2853,7 @@ async function updateOrderByReference(reference, updates = {}, { manual = false 
   let statusApplied = !hasStatusUpdate
   let statusRejected = false
   let nextOrder = null
+  let committedBaseStatus = ""
 
   const result = await orderRef.transaction((current) => {
     // Never return undefined here. The Realtime Database may invoke this
@@ -2838,6 +2868,8 @@ async function updateOrderByReference(reference, updates = {}, { manual = false 
     const base = current === null ? located.order || {} : current
     const candidate = { ...(updates || {}) }
     const currentStatus = normalizeInternalOrderStatus(base?.status, "")
+    // The handler can run several times; the last run is the committed one.
+    committedBaseStatus = currentStatus
 
     if (hasStatusUpdate) {
       const allowed = canApplyOrderStatus(currentStatus, candidate.status, { manual })
@@ -2898,6 +2930,7 @@ async function updateOrderByReference(reference, updates = {}, { manual = false 
     userId: located.userId,
     orderId: located.orderId,
   })
+  await emitOrderDelivered(committedBaseStatus, nextOrder, { userId: located.userId, orderId: located.orderId })
 
   return {
     found: true,
@@ -3483,6 +3516,7 @@ function getWebhookLookupContext(payload = {}, provider = "") {
 }
 
 export {
+  registerOrderDeliveredHook,
   normalizeHubnetSuccessValue,
   isHubnetSuccessfulResponse,
   getHubnetResponseSummary,

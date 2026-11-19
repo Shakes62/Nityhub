@@ -1,6 +1,7 @@
 import { API_BASE } from "@/constants/config";
 import { auth } from "@/lib/firebase";
 import { ApiError, type ApiResponse, type RequestOptions } from "@/types/api";
+import { friendlyMessage } from "@/lib/errors";
 
 /**
  * Centralized API client for the NityHub backend.
@@ -41,19 +42,24 @@ async function parseResponse<T>(response: Response): Promise<ApiResponse<T>> {
     payload = rawBody ? (JSON.parse(rawBody) as ApiResponse<T>) : null;
   } catch {
     const looksLikeHtml = /^\s*</.test(rawBody || "");
-    throw new ApiError(
-      looksLikeHtml
-        ? "Invalid server response. Check the API base URL and CORS configuration."
-        : "Invalid server response",
-      { status: response.status },
-    );
+    if (looksLikeHtml) {
+      // A misconfigured API base or CORS proxy; useful in the console, not on screen.
+      console.error("NityHub API returned HTML. Check NEXT_PUBLIC_API_BASE and CORS.", response.url);
+    }
+    throw new ApiError(friendlyMessage({ status: response.status >= 500 ? response.status : 502 }), {
+      status: response.status || 502,
+    });
   }
 
   if (!response.ok || payload?.status === "error") {
-    throw new ApiError(payload?.message || `Request failed (${response.status})`, {
-      status: response.status,
-      payload,
-    });
+    throw new ApiError(
+      friendlyMessage({
+        message: payload?.message,
+        status: response.status,
+        code: typeof payload?.errorCode === "string" ? payload.errorCode : null,
+      }),
+      { status: response.status, payload },
+    );
   }
 
   return payload ?? ({} as ApiResponse<T>);
@@ -109,10 +115,7 @@ async function performRequest<T>(
     if (error instanceof ApiError) {
       throw error;
     }
-    throw new ApiError(
-      error instanceof Error ? error.message : "Network request failed",
-      { status: 0 },
-    );
+    throw new ApiError(friendlyMessage({ status: 0 }), { status: 0 });
   }
 }
 

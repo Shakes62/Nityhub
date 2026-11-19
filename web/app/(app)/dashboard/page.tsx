@@ -11,6 +11,8 @@ import { ErrorState } from "@/components/ui/states";
 import { formatMoney } from "@/lib/format";
 import { getDashboardData } from "@/services/api";
 import { useAsyncData } from "@/hooks/use-async-data";
+import { BannerCarousel } from "@/components/banners/banner-carousel";
+import { DeliveryTicker } from "@/components/social-proof/delivery-ticker";
 
 export default function DashboardPage() {
   const { data, loading, error, reload } = useAsyncData(getDashboardData, []);
@@ -31,6 +33,10 @@ export default function DashboardPage() {
           </>
         }
       />
+
+      <BannerCarousel />
+
+      <DeliveryTicker />
 
       {error ? (
         <Card>

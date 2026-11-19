@@ -13,7 +13,13 @@ export function normalizeNetwork(network) {
 }
 
 export function normalizeProvider(value, fallback = "") {
-  const provider = String(value || "").trim().toLowerCase()
+  const token = String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_")
+  const provider = {
+    provider_a: "hubnet",
+    provider_b: "godsway",
+    provider_c: "gigshub",
+    provider_d: "pbmhub",
+  }[token] || token
   return SUPPORTED_PROVIDERS.includes(provider) ? provider : fallback
 }
 

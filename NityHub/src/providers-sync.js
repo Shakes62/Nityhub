@@ -16,6 +16,7 @@ import {
 } from "./config.js"
 import { admin, db } from "./firebase.js"
 import { logger } from "./logger.js"
+import { queueRepairConfirmation, runRepairNotificationQueue } from "./repair-notifications.js"
 import { createAppError, getErrorCode, parseJsonText } from "./lib/errors.js"
 import {
   isIndeterminateProviderSubmissionError,
@@ -260,7 +261,7 @@ async function processHubnetTransaction(payload, network) {
         {
           circuitBreaker: hubnetCircuitBreaker,
           timeout: 15000,
-          maxRetries: CONFIG.providerSubmissionMaxRetries,
+          maxRetries: 0,
         },
       )
     } catch (error) {
@@ -415,7 +416,7 @@ async function processGodswayTransaction(payload) {
         {
           circuitBreaker: godswayCircuitBreaker,
           timeout: 15000,
-          maxRetries: CONFIG.providerSubmissionMaxRetries,
+          maxRetries: 0,
         },
       )
     } catch (error) {
@@ -544,7 +545,7 @@ async function processGigshubTransaction(payload) {
         {
           circuitBreaker: gigshubCircuitBreaker,
           timeout: 15000,
-          maxRetries: CONFIG.providerSubmissionMaxRetries,
+          maxRetries: 0,
         },
       )
     } catch (error) {
@@ -1911,6 +1912,20 @@ async function reconcileSingleOrderStatus(orderLocation) {
       providerStatusDescription: result?.providerStatusDescription || order.providerStatusDescription || "",
       status: appliedStatus,
     }).catch(() => null)
+
+    if (appliedStatus === "delivered" && Number(updateResult.order?.repairAttempts || order.repairAttempts || 0) > 0) {
+      await queueRepairConfirmation({
+        reference: order.reference,
+        phone: updateResult.order?.phone || order.phone,
+        userId: orderLocation?.userId || "",
+        guest: updateResult.order?.isGuest === true,
+      }).catch((error) => logger.warn("Repair confirmation queue failed", { reference: order.reference, message: error.message }))
+      runRepairNotificationQueue().catch((error) => logger.warn("Repair confirmation send failed", { reference: order.reference, message: error.message }))
+    }
+    if (appliedStatus === "delivered" && (updateResult.order?.storefrontSlug || order.storefrontSlug)) {
+      const { settleStorefrontProfit } = await import("./storefronts.js")
+      await settleStorefrontProfit(updateResult.order || order).catch((error) => logger.error("Store profit settlement failed", error, { reference: order.reference }))
+    }
 
     return { synced: true, status: appliedStatus, provider }
   } catch (error) {

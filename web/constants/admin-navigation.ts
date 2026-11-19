@@ -3,7 +3,10 @@ import {
   ClipboardList,
   FileText,
   LayoutDashboard,
+  Megaphone,
   Receipt,
+  ShieldCheck,
+  Store,
   Users,
   type LucideIcon,
 } from "lucide-react";
@@ -23,4 +26,7 @@ export const ADMIN_NAV_ITEMS: AdminNavItem[] = [
   { href: "/admin/transactions", label: "Transactions", meta: "Ledger", icon: Receipt },
   { href: "/admin/afa", label: "AFA", meta: "Registrations", icon: FileText },
   { href: "/admin/catalog", label: "Catalog", meta: "Packages", icon: Boxes },
+  { href: "/admin/banners", label: "Banners", meta: "Engagement", icon: Megaphone },
+  { href: "/admin/stores", label: "eStores", meta: "Resellers", icon: Store },
+  { href: "/admin/security", label: "Security", meta: "Anti-fraud", icon: ShieldCheck },
 ];

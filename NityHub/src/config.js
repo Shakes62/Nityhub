@@ -66,7 +66,7 @@ export const CONFIG = {
   // PBM HUB Developer Platform. Every endpoint lives under <base>/api/v1 and
   // takes the key as a plain Bearer token.
   pbmhubApiKey: process.env.PBMHUB_API_KEY,
-  pbmhubBaseUrl: process.env.PBMHUB_BASE_URL || "https://developer.pbmhub.pro",
+  pbmhubBaseUrl: process.env.PBMHUB_BASE_URL || "https://api.pbmhub.pro",
   // PBM HUB addresses each network by its own id, sent as `network` on
   // /purchase. Unlike CK-Godsway, all three of our networks have a documented
   // id, so every default here is a real value rather than a guess. Override per
@@ -115,6 +115,7 @@ export const CONFIG = {
   hubnetStatusPollMaxPerRun: Number(process.env.HUBNET_STATUS_POLL_MAX_PER_RUN || 4),
   purchaseIntentMaxAgeMs: Number(process.env.PURCHASE_INTENT_MAX_AGE_MS || 24 * 60 * 60 * 1000),
   idempotencyWindowMs: Number(process.env.IDEMPOTENCY_WINDOW_MS || 60 * 1000),
+  // PBM HUB alone documents an idempotency key for safe submission retries.
   providerSubmissionMaxRetries: Number(process.env.PROVIDER_SUBMISSION_MAX_RETRIES || 0),
   walletMutationHistoryLimit: Number(process.env.WALLET_MUTATION_HISTORY_LIMIT || 120),
 
@@ -201,9 +202,16 @@ export const DEFAULT_PACKAGE_CATALOG = {
   ],
 }
 
-if (!CONFIG.paystackSecretKey) {
-  console.error("Missing required environment variable: PAYSTACK_SECRET_KEY")
-  process.exit(1)
+/**
+ * Fail fast at server boot when a secret the app cannot run without is absent.
+ * Called from server.js rather than at import time, so pure modules that read
+ * CONFIG (and their unit tests) can load without a full production env.
+ */
+export function assertRequiredConfig() {
+  if (!CONFIG.paystackSecretKey) {
+    console.error("Missing required environment variable: PAYSTACK_SECRET_KEY")
+    process.exit(1)
+  }
 }
 
 // An unauthenticated /webhook lets anyone mark any order delivered, which

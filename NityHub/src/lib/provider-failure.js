@@ -10,7 +10,6 @@
 // other it strands a customer's money on an order that never existed.
 
 import { getErrorCode } from "./errors.js"
-import { normalizeProvider } from "./provider-mapping.js"
 
 export function isIndeterminateProviderSubmissionError(error) {
   const errorCode = getErrorCode(error)
@@ -23,13 +22,13 @@ export function isIndeterminateProviderSubmissionError(error) {
   // status and would otherwise read as a 5xx: that held the debit and parked an
   // order that was never dispatched, on every purchase for as long as the
   // breaker stayed open.
-  if (upstreamCode === "CIRCUIT_OPEN") {
+  if (["CIRCUIT_OPEN", "ECONNREFUSED", "PROVIDER_ROUTE_LOCKED", "PRICE_FLOOR_BLOCKED"].includes(upstreamCode)) {
     return false
   }
 
   // The request left the box and we never heard back. The provider may well
   // have accepted it.
-  if (["REQUEST_TIMEOUT", "NETWORK_ERROR"].includes(upstreamCode)) {
+  if (["REQUEST_TIMEOUT", "NETWORK_ERROR", "ECONNRESET", "ECONNABORTED", "ETIMEDOUT"].includes(upstreamCode)) {
     return true
   }
 
@@ -92,17 +91,5 @@ export function preferInformativeProviderFailure(previous, attempt) {
 }
 
 export function getIndeterminateProviderSubmissionMessage(provider = "") {
-  const normalized = normalizeProvider(provider)
-  const providerLabel =
-    normalized === "godsway"
-      ? "CK-Godsway"
-      : normalized === "hubnet"
-        ? "Hubnet"
-        : normalized === "gigshub"
-          ? "GiGSHUB"
-          : normalized === "pbmhub"
-            ? "PBM HUB"
-            : "provider"
-
-  return `${providerLabel} did not return a final confirmation. Do not retry this purchase yet; it is pending review.`
+  return "We have not received final delivery confirmation. Check this order before trying again; it is pending review."
 }

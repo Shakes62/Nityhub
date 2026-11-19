@@ -9,7 +9,8 @@ import type { WalletData } from "@/types/models";
 import { creditDeposit, getWalletBalance, getWalletData, initiatePayment } from "@/services/api";
 import { Modal } from "@/components/ui/modal";
 import { Receipt, type ReceiptData } from "@/components/receipt/receipt";
-import { useAuth } from "@/contexts/auth-context";
+import { useLiveEvents } from "@/contexts/live-events-context";
+import { errorMessage } from "@/lib/errors";
 import { useToast } from "@/contexts/toast-context";
 import { Button } from "@/components/ui/button";
 import { Card, CardHeader } from "@/components/ui/card";
@@ -22,7 +23,7 @@ const QUICK_AMOUNTS = ["10", "20", "50", "100"];
 function WalletInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const { user } = useAuth();
+  const { wallet: liveWallet } = useLiveEvents();
   const toast = useToast();
 
   const [wallet, setWallet] = useState<WalletData | null>(null);
@@ -37,9 +38,20 @@ function WalletInner() {
     try {
       setWallet(await getWalletData(50));
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Failed to load wallet.");
+      toast.error(errorMessage(error, "Failed to load wallet."));
     }
   }, [toast]);
+
+  // A credit pushed over the live stream (webhook deposit, eStore profit,
+  // refund) refreshes the balance and activity without a reload.
+  const liveBalance = liveWallet?.balance;
+  const lastLive = useRef<number | undefined>(undefined);
+  useEffect(() => {
+    if (liveBalance === undefined) return;
+    if (lastLive.current !== undefined && lastLive.current !== liveBalance) void refresh();
+    lastLive.current = liveBalance;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveBalance]);
 
   // Initial load + confirm a returning Paystack deposit (reference/trxref),
   // then present a professional deposit receipt.
@@ -60,27 +72,35 @@ function WalletInner() {
         /* balance-before is best-effort */
       }
       try {
-        await creditDeposit(reference);
-        let after: number | null = null;
-        try {
-          after = await getWalletBalance();
-        } catch {
-          /* balance-after is best-effort */
+        const result = await creditDeposit(reference);
+        let after: number | null = result.balance;
+        if (after == null) {
+          try {
+            after = await getWalletBalance();
+          } catch {
+            /* balance-after is best-effort */
+          }
         }
         if (!active) return;
-        const credited = before != null && after != null ? Math.max(0, after - before) : 0;
+        const pending = result.status === "pending";
+        // The server's receipt carries the credited amount, which stays right
+        // even when the webhook credited the wallet before this page loaded.
+        const credited = result.amount ?? (before != null && after != null ? Math.max(0, after - before) : 0);
         setDepositReceipt({
           kind: "deposit",
-          status: "success",
+          status: pending ? "pending" : "success",
           title: "Deposit receipt",
           reference,
           date: Date.now(),
-          lines: [{ label: "Channel", value: "Paystack" }],
+          lines: [
+            { label: "Channel", value: "Paystack" },
+            ...(pending ? [{ label: "Status", value: result.message || "Your payment is still being confirmed." }] : []),
+          ],
           amount: credited,
           method: "Paystack",
-          balanceBefore: before,
-          balanceAfter: after,
-          estimatedDelivery: "Reflected immediately",
+          balanceBefore: pending ? before : null,
+          balanceAfter: pending ? null : after,
+          estimatedDelivery: pending ? "Your wallet updates automatically once confirmed" : "Reflected immediately",
           note: `Wallet deposit ${formatMoney(credited)}`,
         });
         router.replace("/wallet");
@@ -94,7 +114,7 @@ function WalletInner() {
           reference,
           date: Date.now(),
           lines: [
-            { label: "Reason", value: error instanceof Error ? error.message : "Confirmation failed" },
+            { label: "Reason", value: errorMessage(error, "We could not confirm this payment. If money left your account, it will be credited automatically or you can contact support.") },
           ],
           amount: 0,
           method: "Paystack",
@@ -117,17 +137,13 @@ function WalletInner() {
     }
     setDepositing(true);
     try {
-      const result = await initiatePayment({
-        paymentType: "wallet",
-        amount: value,
-        reference: `WALLET_${Date.now()}_${(user?.uid || "").slice(0, 6)}`,
-      });
+      const result = await initiatePayment({ paymentType: "wallet", amount: value });
       if (!result.authorization_url) {
         throw new Error("Could not start payment.");
       }
       window.location.href = result.authorization_url;
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Failed to start deposit.");
+      toast.error(errorMessage(error, "Failed to start deposit."));
       setDepositing(false);
     }
   }

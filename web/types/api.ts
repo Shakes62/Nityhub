@@ -2,7 +2,7 @@
 
 /** Standard response envelope returned by every endpoint. */
 export interface ApiResponse<T = unknown> {
-  status?: "success" | "error";
+  status?: "success" | "error" | "pending" | "failed" | (string & {});
   message?: string;
   data?: T;
   [key: string]: unknown;

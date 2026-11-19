@@ -45,6 +45,9 @@ variable — it ships to every visitor.
 | `NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET` | Firebase web config |
 | `NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID` | Firebase web config |
 | `NEXT_PUBLIC_FIREBASE_APP_ID` | Firebase web config |
+| `NEXT_PUBLIC_STOREFRONT_BASE_DOMAIN` | Optional. Same as the backend's `STOREFRONT_BASE_DOMAIN`; enables `<slug>.<domain>` stores |
+| `NEXT_PUBLIC_PLATFORM_HOSTS` | Optional. Comma-separated hosts of the platform itself, e.g. `buy.nityhub.online`. Any other host is treated as a reseller's custom domain |
+| `NEXT_PUBLIC_FIREBASE_VAPID_KEY` | Optional. Web Push certificate key (Firebase → Cloud Messaging). Blank hides the push notification opt-in |
 
 Copy the values from your local `web/.env.local`, which is git-ignored and
 therefore never pushed.
@@ -100,6 +103,10 @@ Optional, but needed for specific routes:
 | `GODSWAY_WEBHOOK_SECRET` | Signing secret from CK-Godsway's **API Keys** page, where you must also register `https://<APP_URL>/webhook/godsway` as the endpoint. CK signs each delivery with a hex HMAC-SHA256 of the raw body; this is **not** the same value as `PROVIDER_WEBHOOK_SECRET`. Unset in production means every CK delivery is rejected, and CK auto-disables the endpoint after 10 consecutive failures. Check `/health` → `security.godswayWebhookSecretConfigured`. |
 | `GODSWAY_AT_NETWORK_KEY` | CK-Godsway's AirtelTigo network code. Unset by default because we have no documented value — leave it blank and AT packages report `networkKey` missing, which blocks routing AT to CK-Godsway (MTN defaults to `YELLO`, Telecel to `TELECEL`). Can also be set per package under Catalog → Packages → Mapping. |
 | `GODSWAY_MTN_NETWORK_KEY` / `GODSWAY_TELECEL_NETWORK_KEY` | Override the `YELLO` / `TELECEL` defaults if CK changes them. |
+| `STOREFRONT_BASE_DOMAIN` | Root for reseller eStore subdomains, e.g. `stores.nityhub.online`. Set the same value as `NEXT_PUBLIC_STOREFRONT_BASE_DOMAIN` on Vercel, add the wildcard domain `*.stores.nityhub.online` to the Vercel project, and point a wildcard DNS record at it. HTTPS subdomains of this root pass CORS automatically. Blank serves stores only at `/store/<slug>`. |
+| `BLACKLIST_HASH_KEY` | Secret used to hash blacklisted phones and identities. Set it once and never rotate it — a new key orphans every entry. Falls back to `PAYSTACK_SECRET_KEY`. |
+| `REPAIR_SMS_WEBHOOK_URL` / `REPAIR_SMS_WEBHOOK_TOKEN` | Optional SMS gateway for repair confirmations (POST JSON `{ to, message, reference }`). Without it, signed-in customers still get in-app and push notifications. |
+| `PBMHUB_BASE_URL` | Use `https://api.pbmhub.pro`. Update an existing deployment if it still has the old `https://developer.pbmhub.pro` value; an explicit environment value overrides the corrected code default. |
 
 ---
 
@@ -119,18 +126,40 @@ production domain is in the CORS allowlist unless you add the others.
 
 ---
 
-## 4. Realtime Database rule
+## 4. Realtime Database rules
 
-The refund worker queries `refund_queue` by `status`. Without this index every
-sweep downloads the whole node:
+Several background workers and feeds query by a child field. Without an index
+each query downloads the whole node, so add these to your database rules:
 
 ```json
 {
   "rules": {
-    "refund_queue": { ".indexOn": ["status"] }
+    "refund_queue": { ".indexOn": ["status"] },
+    "pending_fulfillment": { ".indexOn": ["nextAttemptAt"] },
+    "repair_notifications": { ".indexOn": ["nextAttemptAt"] },
+    "delivery_feed": { ".indexOn": ["deliveredAt"] },
+    "risk_flags": { ".indexOn": ["lastAt"] },
+    "user_notifications": { "$uid": { ".indexOn": ["createdAt"] } }
   }
 }
 ```
+
+These nodes are written only by the backend (Admin SDK). Keep client read and
+write access to them denied.
+
+### Paystack webhook
+
+Register `https://<APP_URL>/webhook/paystack` under Paystack → Settings → API
+Keys & Webhooks. It credits wallet deposits and fulfils paid bundles for buyers
+who close the tab before returning to the site. It is verified against
+`PAYSTACK_SECRET_KEY` and is never rate limited.
+
+### Reseller custom domains
+
+A reseller can connect their own domain under **Your eStore**. They point a
+CNAME at the Vercel project, and you add the domain to the Vercel project so it
+gets a certificate. List the platform's own hosts in
+`NEXT_PUBLIC_PLATFORM_HOSTS`; any other host is resolved as a custom store.
 
 ---
 

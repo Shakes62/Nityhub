@@ -28,6 +28,15 @@ import {
   pbmhubCircuitBreaker,
 } from "./lib/http.js"
 import { generateReference } from "./lib/reference.js"
+import { verifiedWalletDepositMatchesOwner } from "./lib/payment-verification.js"
+import {
+  verifyPaystackWebhookSignature,
+  paystackWebhookReplayCache,
+  settleWalletDeposit,
+} from "./lib/deposit-settlement.js"
+import { computeDeliveryEstimates } from "./lib/social-proof-rules.js"
+import { getDeliveryProofs, getDeliveryEstimates } from "./delivery-feed.js"
+import { normalizeBanner, sortBanners, getDefaultBanners, isValidBannerId } from "./lib/banner-rules.js"
 import { WALLET_MUTATION } from "./lib/wallet-core.js"
 import {
   processedTransactions,
@@ -45,7 +54,24 @@ import {
   releasePhoneTransactionLock,
   releaseUserTransactionLock,
 } from "./state.js"
-import { purchaseActionRateLimit, paymentVerificationRateLimit, adminMutationRateLimit } from "./middleware.js"
+import { purchaseActionRateLimit, purchaseVelocityRateLimit, paymentVerificationRateLimit, adminMutationRateLimit } from "./middleware.js"
+import { registerStorefrontRoutes, settleStorefrontProfit } from "./storefronts.js"
+import { maskPhoneNumber } from "./lib/storefront-rules.js"
+import { registerCacheReset } from "./lib/runtime-cache.js"
+import {
+  startBlacklistSync, isRecipientBlocked, isIdentityBlocked, assessRecipientVelocity, changeBlacklist,
+  getBlacklistStatus, getBlacklistCounts, listRiskFlags, clearRiskFlag,
+} from "./security-controls.js"
+import { claimRepairLease, releaseRepairLease, claimRepairDispatch } from "./repair-lock.js"
+import { classifyRepairState, canRedispatchAfterStatus, hasDefinitiveProviderFailure, hasProviderSubmissionEvidence, isValidRepairReference } from "./lib/repair-rules.js"
+import { queueRepairConfirmation, runRepairNotificationQueue } from "./repair-notifications.js"
+import { enqueueFulfillment, setFulfillmentRunner } from "./fulfillment-queue.js"
+import { registerRealtimeRoutes } from "./realtime.js"
+import {
+  getVendingControls, saveVendingControls, isNetworkAvailable,
+  getProviderCosts, saveProviderCosts, checkPriceFloor, evaluateSaleGuard,
+  claimProviderDispatch, recordProviderDispatch, getDispatchHealth, resetProviderDispatchHealth,
+} from "./lib/vending-controls.js"
 import {
   normalizeHubnetSuccessValue,
   isHubnetSuccessfulResponse,
@@ -211,7 +237,6 @@ import {
   getOrderSyncHealthSummary,
   getProviderHealthSnapshot,
   getProviderErrorHttpStatus,
-  getProviderErrorMessage,
   isIndeterminateProviderSubmissionError,
   getIndeterminateProviderSubmissionMessage,
   preferInformativeProviderFailure,
@@ -225,6 +250,96 @@ import {
 } from "./providers-sync.js"
 
 export function registerRoutes(app) {
+startBlacklistSync()
+setFulfillmentRunner(runRepairPipeline)
+registerRealtimeRoutes(app)
+registerStorefrontRoutes(app)
+function normalizeBlacklistValue(kind, raw) {
+  if (kind === "phone") {
+    const phone = sanitizePhoneNumber(raw)
+    return /^0\d{9}$/.test(phone) ? phone : ""
+  }
+  if (kind === "identity") {
+    const value = String(raw || "").trim().toLowerCase()
+    return value.length >= 3 && value.length <= 254 ? value : ""
+  }
+  return ""
+}
+
+app.get("/api/admin/security/overview", authenticateRequest, requirePrivilegedAccess, async (_req, res) => {
+  try {
+    const [counts, flags] = await Promise.all([getBlacklistCounts(), listRiskFlags(50)])
+    return res.json({ status: "success", data: { blacklist: counts, riskFlags: flags } })
+  } catch (error) {
+    logger.error("Failed to load security overview", error)
+    return res.status(503).json({ status: "error", message: "Security data could not be loaded." })
+  }
+})
+
+app.get("/api/admin/blacklist/:kind", authenticateRequest, requirePrivilegedAccess, async (req, res) => {
+  const value = normalizeBlacklistValue(req.params.kind, req.query?.value)
+  if (!value) return res.status(400).json({ status: "error", message: "Enter a valid 10-digit phone number, email or user id." })
+  try {
+    return res.json({ status: "success", data: await getBlacklistStatus(req.params.kind, value) })
+  } catch {
+    return res.status(400).json({ status: "error", message: "Invalid blacklist entry" })
+  }
+})
+
+app.put("/api/admin/blacklist/:kind", authenticateRequest, requirePrivilegedAccess, adminMutationRateLimit, async (req, res) => {
+  const kind = req.params.kind
+  const value = normalizeBlacklistValue(kind, req.body?.value)
+  if (!value) return res.status(400).json({ status: "error", message: "Enter a valid 10-digit phone number, email or user id." })
+  try {
+    const active = req.body?.active === true
+    const hash = await changeBlacklist(kind, value, active, req.authUser.uid, req.body?.note)
+    await recordAuditEvent({
+      actorUid: req.authUser.uid, action: active ? "admin.blacklist.add" : "admin.blacklist.remove",
+      targetRef: hash.slice(0, 16), status: "success", metadata: { kind },
+    }).catch(() => null)
+    return res.json({ status: "success", data: { hash, active } })
+  } catch {
+    return res.status(400).json({ status: "error", message: "Invalid blacklist entry" })
+  }
+})
+
+app.delete("/api/admin/risk-flags/:id", authenticateRequest, requirePrivilegedAccess, adminMutationRateLimit, async (req, res) => {
+  try {
+    await clearRiskFlag(req.params.id)
+    return res.json({ status: "success", data: { cleared: true } })
+  } catch {
+    return res.status(400).json({ status: "error", message: "Invalid flag" })
+  }
+})
+
+async function dispatchGuarded({ provider, network, catalogEntry, amount, purchase }) {
+  const floor = await evaluateSaleGuard({ network, packageId: catalogEntry.id, provider, price: amount })
+  if (floor.reason === "network_paused") {
+    throw createAppError("NETWORK_PAUSED", { upstreamCode: "PROVIDER_ROUTE_LOCKED" })
+  }
+  if (!floor.allowed) {
+    logger.error("Provider route blocked by price floor", new Error(floor.reason), {
+      network, packageId: catalogEntry.id, provider, amount, cost: floor.cost,
+    })
+    throw createAppError("PRICE_FLOOR_BLOCKED", { upstreamCode: "PRICE_FLOOR_BLOCKED" })
+  }
+  const token = crypto.randomUUID()
+  if (!(await claimProviderDispatch(provider, token))) {
+    throw createAppError("PROVIDER_COOLDOWN", { upstreamCode: "CIRCUIT_OPEN" })
+  }
+  try {
+    const result = await purchase()
+    await recordProviderDispatch(provider, token, "success").catch((error) => logger.error("Dispatch health update failed", error))
+    return result
+  } catch (error) {
+    const code = getErrorCode(error)
+    const hardFail = /AUTH_FAILED|INSUFFICIENT_.*_BALANCE|WALLET_FROZEN/.test(code)
+    await recordProviderDispatch(provider, token, hardFail ? "hard_fail" : isIndeterminateProviderSubmissionError(error) ? "uncertain" : "failed")
+      .catch((healthError) => logger.error("Dispatch health update failed", healthError))
+    throw error
+  }
+}
+
 app.post("/webhook", express.json(), async (req, res) => {
   try {
     if (!isWebhookIpAllowed(req.ip)) {
@@ -343,6 +458,9 @@ app.post("/webhook", express.json(), async (req, res) => {
       paymentStatus: "success",
       errorMessage: "",
     }).catch(() => null)
+    if (appliedStatus === "delivered" && result.order?.storefrontSlug) {
+      await settleStorefrontProfit(result.order).catch((error) => logger.error("Store profit settlement failed", error, { reference: canonicalReference }))
+    }
 
     processedTransactions.add(canonicalReference, {
       reference: canonicalReference,
@@ -494,6 +612,9 @@ app.post("/webhook/gigshub", async (req, res) => {
         paymentStatus: "success",
         errorMessage: "",
       }).catch(() => null)
+      if (appliedStatus === "delivered" && updateResult.order?.storefrontSlug) {
+        await settleStorefrontProfit(updateResult.order).catch((error) => logger.error("Store profit settlement failed", error, { reference }))
+      }
 
       processedTransactions.add(reference, {
         reference,
@@ -665,6 +786,9 @@ app.post("/webhook/godsway", async (req, res) => {
       paymentStatus: "success",
       errorMessage: "",
     }).catch(() => null)
+    if (appliedStatus === "delivered" && updateResult.order?.storefrontSlug) {
+      await settleStorefrontProfit(updateResult.order).catch((error) => logger.error("Store profit settlement failed", error, { reference }))
+    }
 
     processedTransactions.add(reference, {
       reference,
@@ -694,6 +818,141 @@ app.post("/webhook/godsway", async (req, res) => {
     return res.status(500).json({ status: false, message: "Webhook processing failed" })
   }
 })
+
+/**
+ * Paystack Webhook Handler (Dual-Ingestion Push Stream - Module 3)
+ * Verifies HMAC-SHA512 raw body signature against PAYSTACK_SECRET_KEY.
+ * Applies 15-minute anti-replay cache to deduplicate retries without database queries.
+ * Settles wallet deposits atomically via settleWalletDeposit with instant SSE broadcast.
+ */
+async function handlePaystackWebhook(req, res) {
+  const rawBody = Buffer.isBuffer(req.rawBody) ? req.rawBody : null
+  if (!rawBody) {
+    logger.warn("[PAYSTACK WEBHOOK] Rejected: raw body unavailable", { ip: req.ip })
+    return res.status(400).json({ status: false, message: "Invalid webhook payload" })
+  }
+
+  const signature = req.headers["x-paystack-signature"]
+  const secret = String(CONFIG.paystackSecretKey || "").trim()
+
+  if (!secret) {
+    logger.error("[PAYSTACK WEBHOOK] Rejected: PAYSTACK_SECRET_KEY is not configured")
+    return res.status(500).json({ status: false, message: "Webhook secret not configured" })
+  }
+
+  // HMAC over the exact bytes received, never a re-serialised object.
+  if (!verifyPaystackWebhookSignature(rawBody, signature, secret)) {
+    logger.warn("[PAYSTACK WEBHOOK] Rejected: invalid signature", { ip: req.ip })
+    return res.status(401).json({ status: false, message: "Invalid webhook signature" })
+  }
+
+  // 15-minute anti-replay cache. The key is recorded only after the event has
+  // been handled successfully: recording it up front meant a delivery that
+  // failed mid-settlement was acknowledged as a "duplicate" on Paystack's
+  // retry, and that deposit was never credited by the webhook at all.
+  const cacheKey = `paystack:${crypto.createHash("sha256").update(rawBody).digest("hex")}`
+  if (paystackWebhookReplayCache.isDuplicate(cacheKey)) {
+    logger.info("[PAYSTACK WEBHOOK] Replay ignored (cached)", { ip: req.ip })
+    return res.status(200).json({ status: true, message: "Duplicate webhook delivery acknowledged" })
+  }
+
+  let payload = null
+  try {
+    payload = JSON.parse(rawBody.toString("utf8"))
+  } catch (err) {
+    logger.warn("[PAYSTACK WEBHOOK] JSON parse failed", { ip: req.ip, error: err.message })
+    return res.status(400).json({ status: false, message: "Malformed JSON" })
+  }
+
+  const event = String(payload?.event || "").trim()
+  logger.info("[PAYSTACK WEBHOOK] Received event", { event, ip: req.ip })
+
+  if (event !== "charge.success") {
+    paystackWebhookReplayCache.record(cacheKey)
+    return res.status(200).json({ status: true, message: "Event ignored" })
+  }
+
+  const data = payload?.data || {}
+  const reference = String(data.reference || "").trim()
+  const amountUnits = Number(data.amount || 0)
+  const metadata = data.metadata && typeof data.metadata === "object" ? data.metadata : {}
+  const paymentType = String(metadata.paymentType || "bundle").toLowerCase()
+
+  if (!reference || !Number.isSafeInteger(amountUnits) || amountUnits <= 0 || String(data.currency || "").toUpperCase() !== "GHS") {
+    logger.warn("[PAYSTACK WEBHOOK] Invalid charge data", { reference, amount: data.amount, currency: data.currency })
+    // Acknowledge: retrying a structurally invalid event cannot succeed.
+    paystackWebhookReplayCache.record(cacheKey)
+    return res.status(200).json({ status: true, message: "Charge ignored" })
+  }
+
+  if (paymentType === "wallet") {
+    const userId = String(metadata.userId || "").trim()
+    if (!userId) {
+      logger.warn("[PAYSTACK WEBHOOK] Missing userId in wallet deposit metadata", { reference })
+      paystackWebhookReplayCache.record(cacheKey)
+      return res.status(200).json({ status: true, message: "Charge ignored" })
+    }
+
+    try {
+      const result = await settleWalletDeposit({
+        reference,
+        userId,
+        amount: amountUnits / 100,
+        paidAt: data.paid_at || null,
+        channel: String(data.channel || "paystack"),
+        source: "webhook",
+      })
+      if (result.inProgress) {
+        // The client verify call is crediting right now. Ask Paystack to retry
+        // so this delivery confirms the outcome instead of assuming it.
+        return res.status(409).json({ status: false, message: "Settlement in progress" })
+      }
+      paystackWebhookReplayCache.record(cacheKey)
+      logger.info("[PAYSTACK WEBHOOK] Wallet deposit settled", { reference, userId, alreadyCredited: result.alreadyCredited })
+      return res.status(200).json({ status: true, message: result.message })
+    } catch (error) {
+      if (/another account/i.test(error.message || "")) {
+        logger.error("[PAYSTACK WEBHOOK] Deposit ownership conflict", error, { reference, userId })
+        paystackWebhookReplayCache.record(cacheKey)
+        return res.status(200).json({ status: true, message: "Charge flagged for review" })
+      }
+      logger.error("[PAYSTACK WEBHOOK] Wallet settlement failed", error, { reference, userId })
+      return res.status(500).json({ status: false, message: "Deposit settlement failed" })
+    }
+  }
+
+  if (!["bundle", "guest_bundle"].includes(paymentType)) {
+    paystackWebhookReplayCache.record(cacheKey)
+    return res.status(200).json({ status: true, message: "Event ignored" })
+  }
+
+  // Data bundle: note the confirmed payment on the intent (never downgrading a
+  // later state such as refunded), then make sure it gets fulfilled even if
+  // the buyer never comes back to the site.
+  try {
+    await getPurchaseIntentRef(reference).transaction((current) => {
+      if (!current) return current
+      const status = String(current.paymentStatus || "").toLowerCase()
+      if (status && !["initialized", "pending"].includes(status)) return current
+      return { ...current, paymentStatus: "success", updatedAt: Date.now() }
+    })
+    await enqueueFulfillment(reference, {
+      requesterUid: paymentType === "guest_bundle" ? "" : String(metadata.userId || ""),
+      // Guests land on the receipt page, which fulfils immediately; the queue
+      // only needs to catch the ones who closed the tab.
+      delayMs: paymentType === "guest_bundle" ? 20_000 : 45_000,
+    })
+    paystackWebhookReplayCache.record(cacheKey)
+    logger.info("[PAYSTACK WEBHOOK] Bundle payment confirmed", { reference, paymentType })
+    return res.status(200).json({ status: true, message: "Bundle payment confirmed" })
+  } catch (error) {
+    logger.error("[PAYSTACK WEBHOOK] Bundle payment update failed", error, { reference })
+    return res.status(500).json({ status: false, message: "Bundle update failed" })
+  }
+}
+
+app.post("/webhook/paystack", handlePaystackWebhook)
+app.post("/api/webhook/paystack", handlePaystackWebhook)
 
 // Update Hubnet payload to include webhook
 app.get("/health", (req, res) => {
@@ -754,6 +1013,82 @@ app.get("/", (req, res) => {
  * non-agent has no way to be shown or charged agent pricing. The response shape
  * is identical for every tier, which is also what keeps agent status invisible.
  */
+app.get("/api/network-availability", async (req, res) => {
+  try {
+    const controls = await getVendingControls()
+    // Estimates are decoupled from availability: a paused network keeps its
+    // measured delivery time, and the card says "paused" separately.
+    const estimates = await getDeliveryEstimates().catch(() => computeDeliveryEstimates([]))
+    res.set("Cache-Control", "no-store")
+    return res.json({ status: "success", data: { enabled: controls.enabled, networks: controls.networks, estimates } })
+  } catch (error) {
+    logger.error("Failed to load network availability", error)
+    return res.status(503).json({ status: "error", message: "Network availability could not be checked" })
+  }
+})
+
+let publicBannerCache = { at: 0, data: null }
+registerCacheReset(() => { publicBannerCache = { at: 0, data: null } })
+
+/**
+ * Banners from the database, seeded with the defaults exactly once. The seed
+ * is recorded under settings/, so an admin who deletes every banner gets an
+ * empty carousel rather than the defaults springing back.
+ */
+async function getStoredBanners() {
+  const snap = await db.ref("banners").once("value")
+  if (snap.exists()) {
+    const stored = snap.val() || {}
+    // An earlier build seeded a made-up promo and an uptime claim. Retire them,
+    // but only while untouched - an admin-edited copy is theirs to keep.
+    const legacy = ["banner-default-promo", "banner-default-operational"]
+      .filter((id) => stored[id] && Number(stored[id].updatedAt) === 1729200000000)
+    if (legacy.length) {
+      await db.ref().update(Object.fromEntries(legacy.map((id) => [`banners/${id}`, null]))).catch(() => null)
+      for (const id of legacy) delete stored[id]
+    }
+    return Object.values(stored)
+  }
+  // Only the call that creates the flag seeds; every later call sees it.
+  const seeded = await db.ref("settings/banners_seeded").transaction((current) => (current ? undefined : { at: Date.now() }))
+  if (!seeded.committed) {
+    return []
+  }
+  const defaults = getDefaultBanners()
+  const updates = {}
+  for (const b of defaults) {
+    updates[`banners/${b.id}`] = b
+  }
+  await db.ref().update(updates)
+  return defaults
+}
+
+app.get("/api/social-proof/deliveries", async (_req, res) => {
+  try {
+    const data = await getDeliveryProofs(10)
+    res.set("Cache-Control", "public, max-age=30")
+    return res.json({ status: "success", data, timestamp: new Date().toISOString() })
+  } catch (error) {
+    // No proof is better than invented proof: the ticker hides itself.
+    logger.warn("Failed to fetch social proof deliveries", { message: error?.message })
+    return res.json({ status: "success", data: [], timestamp: new Date().toISOString() })
+  }
+})
+
+app.get("/api/banners", async (_req, res) => {
+  try {
+    const now = Date.now()
+    if (!publicBannerCache.data || now - publicBannerCache.at > 30_000) {
+      publicBannerCache = { at: now, data: await getStoredBanners() }
+    }
+    res.set("Cache-Control", "public, max-age=60")
+    return res.json({ status: "success", data: sortBanners(publicBannerCache.data, true, now), timestamp: new Date().toISOString() })
+  } catch (error) {
+    logger.error("Failed to load public banners", error)
+    return res.json({ status: "success", data: [], timestamp: new Date().toISOString() })
+  }
+})
+
 app.get("/api/packages/:network", optionalAuthenticateRequest, async (req, res) => {
   const network = normalizeNetwork(req.params.network)
 
@@ -766,6 +1101,11 @@ app.get("/api/packages/:network", optionalAuthenticateRequest, async (req, res) 
   }
 
   try {
+    res.set("Cache-Control", "no-store")
+    const controls = await getVendingControls()
+    if (!isNetworkAvailable(controls, network)) {
+      return res.json({ status: "success", data: [], availability: "maintenance" })
+    }
     const uid = String(req.authUser?.uid || "").trim()
     // Anonymous callers and failed role lookups both fall back to regular
     // pricing: a discount is only ever granted on an explicit true.
@@ -773,11 +1113,21 @@ app.get("/api/packages/:network", optionalAuthenticateRequest, async (req, res) 
     // Priced against the primary provider for this network — the same one the
     // purchase will be quoted and charged at, so the shelf price and the till
     // price cannot disagree.
-    const activeProvider = await getActiveProviderForNetwork(network).catch(() => "")
+    const route = await getProviderRouteForNetwork(network)
+    const activeProvider = route[0] || ""
     const rows = await getCatalogPackages(network)
+    const costs = await getProviderCosts(network)
     return res.json({
       status: "success",
-      data: rows.map((entry) => toPublicCatalogEntry(entry, { agentPricing, provider: activeProvider })),
+      data: rows.filter((entry) => route.some((provider) =>
+        isProviderConfigured(provider) && isCompleteProviderMapping(network, provider, entry) &&
+        checkPriceFloor({
+          costs, packageId: entry.id, provider,
+          price: resolveEffectivePackagePrice(entry, { agentPricing, provider: activeProvider }),
+          minimumMargin: controls.minimumMargin,
+          requireCost: controls.requireProviderCosts,
+        }).allowed,
+      )).map((entry) => toPublicCatalogEntry(entry, { agentPricing, provider: activeProvider })),
       timestamp: new Date().toISOString(),
     })
   } catch (error) {
@@ -953,6 +1303,7 @@ app.put("/api/admin/provider-routing", authenticateRequest, requirePrivilegedAcc
 app.get("/api/admin/provider-health", authenticateRequest, requirePrivilegedAccess, async (req, res) => {
   try {
     const data = await getProviderHealthSnapshot()
+    data.dispatch = await getDispatchHealth()
     return res.json({
       status: "success",
       data,
@@ -965,6 +1316,59 @@ app.get("/api/admin/provider-health", authenticateRequest, requirePrivilegedAcce
       message: "Failed to load provider health",
       timestamp: new Date().toISOString(),
     })
+  }
+})
+
+app.get("/api/admin/vending-controls", authenticateRequest, requirePrivilegedAccess, async (req, res) => {
+  try {
+    return res.json({ status: "success", data: await getVendingControls({ fresh: true }) })
+  } catch (error) {
+    logger.error("Failed to load vending controls", error)
+    return res.status(503).json({ status: "error", message: "Could not load vending controls" })
+  }
+})
+
+app.put("/api/admin/vending-controls", authenticateRequest, requirePrivilegedAccess, adminMutationRateLimit, async (req, res) => {
+  let data
+  try {
+    data = await saveVendingControls(req.body, req.authUser.uid)
+  } catch (error) {
+    return res.status(400).json({ status: "error", message: error.message || "Invalid vending controls" })
+  }
+  await recordAuditEvent({ actorUid: req.authUser.uid, action: "admin.vending_controls.update", status: "success", metadata: data })
+    .catch((error) => logger.warn("Vending controls audit failed", { message: error.message }))
+  return res.json({ status: "success", data })
+})
+
+app.post("/api/admin/provider-health/:provider/reset", authenticateRequest, requirePrivilegedAccess, adminMutationRateLimit, async (req, res) => {
+  try {
+    await resetProviderDispatchHealth(req.params.provider)
+    await recordAuditEvent({ actorUid: req.authUser.uid, action: "admin.provider_dispatch.reset", targetRef: req.params.provider, status: "success" })
+      .catch(() => null)
+    return res.json({ status: "success", data: await getDispatchHealth() })
+  } catch (error) {
+    return res.status(400).json({ status: "error", message: error.message || "Could not reset provider" })
+  }
+})
+
+app.get("/api/admin/provider-costs/:network", authenticateRequest, requirePrivilegedAccess, async (req, res) => {
+  const network = normalizeNetwork(req.params.network)
+  if (!SUPPORTED_PACKAGE_NETWORKS.includes(network)) return res.status(400).json({ status: "error", message: "Unsupported network" })
+  try {
+    return res.json({ status: "success", data: await getProviderCosts(network) })
+  } catch (error) {
+    logger.error("Failed to load provider costs", error, { network })
+    return res.status(503).json({ status: "error", message: "Could not load provider costs" })
+  }
+})
+
+app.put("/api/admin/provider-costs/:network", authenticateRequest, requirePrivilegedAccess, adminMutationRateLimit, async (req, res) => {
+  try {
+    const data = await saveProviderCosts(req.params.network, req.body?.costs, req.authUser.uid)
+    await recordAuditEvent({ actorUid: req.authUser.uid, action: "admin.provider_costs.update", targetRef: req.params.network, status: "success" })
+    return res.json({ status: "success", data })
+  } catch (error) {
+    return res.status(400).json({ status: "error", message: error.message || "Invalid provider costs" })
   }
 })
 
@@ -1150,6 +1554,51 @@ app.get("/api/admin/overview", authenticateRequest, requirePrivilegedAccess, asy
       message: "Failed to load admin overview",
       timestamp: new Date().toISOString(),
     })
+  }
+})
+
+app.get("/api/admin/banners", authenticateRequest, requirePrivilegedAccess, async (_req, res) => {
+  try {
+    const raw = await getStoredBanners()
+    const banners = sortBanners(raw, false)
+    return res.json({ status: "success", data: banners, timestamp: new Date().toISOString() })
+  } catch (error) {
+    logger.error("Failed to load admin banners", error)
+    return res.status(500).json({ status: "error", message: "Failed to load banners" })
+  }
+})
+
+app.put("/api/admin/banners", authenticateRequest, requirePrivilegedAccess, adminMutationRateLimit, async (req, res) => {
+  try {
+    const requestedId = String(req.body?.id || "").trim()
+    if (requestedId && !isValidBannerId(requestedId)) {
+      return res.status(400).json({ status: "error", message: "Invalid banner id" })
+    }
+    const existing = requestedId ? (await db.ref(`banners/${requestedId}`).once("value")).val() : null
+    const normalized = normalizeBanner(req.body, requestedId || null, existing)
+    await db.ref(`banners/${normalized.id}`).set(normalized)
+    publicBannerCache = { at: 0, data: null }
+    logger.info("Admin updated banner", { bannerId: normalized.id, adminUid: req.authUser.uid })
+    return res.json({ status: "success", data: normalized, timestamp: new Date().toISOString() })
+  } catch (error) {
+    logger.error("Failed to update banner", error)
+    return res.status(400).json({ status: "error", message: error?.message || "Failed to save banner" })
+  }
+})
+
+app.delete("/api/admin/banners/:id", authenticateRequest, requirePrivilegedAccess, adminMutationRateLimit, async (req, res) => {
+  try {
+    const bannerId = String(req.params.id || "").trim()
+    if (!isValidBannerId(bannerId)) {
+      return res.status(400).json({ status: "error", message: "Banner ID is required" })
+    }
+    await db.ref(`banners/${bannerId}`).remove()
+    publicBannerCache = { at: 0, data: null }
+    logger.info("Admin deleted banner", { bannerId, adminUid: req.authUser.uid })
+    return res.json({ status: "success", message: "Banner deleted", bannerId, timestamp: new Date().toISOString() })
+  } catch (error) {
+    logger.error("Failed to delete banner", error)
+    return res.status(500).json({ status: "error", message: "Failed to delete banner" })
   }
 })
 
@@ -1700,21 +2149,22 @@ app.post("/api/wallet/credit-deposit", authenticateRequest, async (req, res) => 
     }
   }
 
-  const lockAcquired = acquireTransactionLock(reference, 30000)
-  if (!lockAcquired) {
-    return res.status(409).json({
-      status: "error",
-      message: "Deposit verification already in progress",
-      timestamp: new Date().toISOString(),
-    })
-  }
-
   try {
     await ensureUserAccountState(userId, req.authUser)
     const verifyData = await verifyPaystackPayment(reference)
     const paymentData = verifyData?.data || {}
     const paymentType = paymentData.metadata?.paymentType || "bundle"
-    const paymentUserId = paymentData.metadata?.userId || null
+
+    // Mobile Money approvals can outlast the redirect back to the site. That is
+    // not a failure: the webhook credits the wallet the moment it settles.
+    if (verifyData.status && paymentType === "wallet" &&
+      ["pending", "ongoing", "processing", "queued", "send_otp", "send_birthday", "send_pin"].includes(String(paymentData.status || "").toLowerCase())) {
+      return res.status(202).json({
+        status: "pending",
+        message: "Your payment is still being confirmed. Your wallet will update automatically.",
+        timestamp: new Date().toISOString(),
+      })
+    }
 
     if (!verifyData.status || paymentData.status !== "success" || paymentType !== "wallet") {
       return res.status(400).json({
@@ -1724,55 +2174,36 @@ app.post("/api/wallet/credit-deposit", authenticateRequest, async (req, res) => 
       })
     }
 
-    if (paymentUserId && paymentUserId !== userId) {
+    if (!verifiedWalletDepositMatchesOwner(paymentData, reference, userId)) {
       return res.status(403).json({
         status: "error",
-        message: "This payment reference belongs to another account",
+        message: "Payment details do not match this wallet deposit",
         timestamp: new Date().toISOString(),
       })
     }
 
     const amount = Number(paymentData.amount || 0) / 100
-    const mutationId = sanitizeMutationId(`deposit:${reference}`)
-    const balance = await updateWalletBalance(userId, amount, {
-      mutationId,
-      reason: "wallet_deposit",
+    const result = await settleWalletDeposit({
       reference,
-      details: {
-        channel: "paystack",
-      },
-    })
-    const transaction = await recordTransaction({
       userId,
-      type: "deposit",
       amount,
-      balance,
-      reference,
-      mutationId,
-      details: {
-        channel: "paystack",
-        paidAt: paymentData.paid_at || null,
-      },
-    })
-
-    const receipt = {
-      userId,
-      reference,
-      amount,
-      balance,
-      status: "credited",
-      paymentType: "wallet",
       paidAt: paymentData.paid_at || null,
-      updatedAt: Date.now(),
-      transactionId: transaction.id,
-    }
+      channel: String(paymentData.channel || "paystack"),
+      source: "client_polling",
+    })
 
-    await receiptRef.set(receipt)
+    if (result.inProgress) {
+      return res.status(202).json({
+        status: "pending",
+        message: "Your deposit is being credited. Your balance will update in a moment.",
+        timestamp: new Date().toISOString(),
+      })
+    }
 
     return res.json({
       status: "success",
-      message: "Wallet credited successfully",
-      data: receipt,
+      message: result.message,
+      data: result.receipt,
       timestamp: new Date().toISOString(),
     })
   } catch (error) {
@@ -1793,12 +2224,10 @@ app.post("/api/wallet/credit-deposit", authenticateRequest, async (req, res) => 
       message: "Failed to credit wallet deposit",
       timestamp: new Date().toISOString(),
     })
-  } finally {
-    releaseTransactionLock(reference)
   }
 })
 
-app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, async (req, res) => {
+app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, purchaseVelocityRateLimit, async (req, res) => {
   const userId = req.authUser.uid
   const network = normalizeNetwork(req.body?.network)
   const phone = sanitizePhoneNumber(req.body?.phone)
@@ -1831,9 +2260,15 @@ app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, a
       timestamp: new Date().toISOString(),
     })
   }
+  if (isRecipientBlocked(phone) || isIdentityBlocked(userId) || assessRecipientVelocity(userId, phone)) {
+    return res.status(403).json({ status: "error", message: "This recipient number cannot be processed at this time." })
+  }
 
   try {
     await ensureUserAccountState(userId, req.authUser)
+    if (!isNetworkAvailable(await getVendingControls(), network)) {
+      return res.status(503).json({ status: "error", message: "This network is back shortly. Please try another network." })
+    }
     const catalogEntry = await getCatalogPackage(network, { packageId })
     if (!catalogEntry || catalogEntry.enabled === false) {
       return res.status(400).json({
@@ -1970,6 +2405,7 @@ app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, a
 
     const lockAcquired = acquireUserTransactionLock(userId)
     if (!lockAcquired) {
+      await updateIdempotencyKey(userId, idempotencyKey, { status: "failed" }).catch(() => null)
       return res.status(409).json({
         status: "error",
         message: "You have a transaction in progress. Please wait.",
@@ -1989,30 +2425,31 @@ app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, a
     let held = false
     let captured = false
     let vendorCompleted = false
-    await upsertPurchaseIntent(reference, {
-      reference,
-      userId,
-      type: "wallet_purchase",
-      network,
-      phone,
-      packageId: catalogEntry.id,
-      volume: catalogEntry.volume,
-      label: catalogEntry.label,
-      amount,
-      paymentStatus: "wallet_debited_pending",
-      orderStatus: "pending",
-      provider,
-      providerSubmissionStatus: "pending",
-      metadata: {
-        origin: "wallet_purchase",
-      },
-    })
-    await updateIdempotencyKey(userId, idempotencyKey, {
-      reference,
-      status: "accepted",
-    }).catch(() => null)
-
+    let providerResult = null
     try {
+      await upsertPurchaseIntent(reference, {
+        reference,
+        userId,
+        type: "wallet_purchase",
+        network,
+        phone,
+        packageId: catalogEntry.id,
+        volume: catalogEntry.volume,
+        label: catalogEntry.label,
+        amount,
+        paymentStatus: "wallet_debited_pending",
+        orderStatus: "pending",
+        provider,
+        providerSubmissionStatus: "pending",
+        metadata: {
+          origin: "wallet_purchase",
+        },
+      })
+      await updateIdempotencyKey(userId, idempotencyKey, {
+        reference,
+        status: "accepted",
+      }).catch(() => null)
+
       // RESERVE, do not charge. The funds stop being spendable so a second
       // purchase cannot claim them, but the balance does not move until a
       // provider has actually taken the order.
@@ -2033,21 +2470,20 @@ app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, a
       // uncertain one (timeout, connection reset) must NOT - the order may
       // already be live upstream, and attempting it elsewhere would deliver and
       // charge for the same bundle twice.
-      let providerResult = null
       let lastFailure = null
       const providerAttempts = []
 
       for (const [index, candidate] of candidates.entries()) {
         provider = candidate.provider
         try {
-          providerResult = await getProviderAdapter(provider).purchase({
+          providerResult = await dispatchGuarded({ provider, network, catalogEntry, amount, purchase: () => getProviderAdapter(provider).purchase({
             network,
             phone,
             reference,
             catalogEntry,
             amount,
             hasNextProvider: hasCandidateAfter(candidates, index),
-          })
+          }) })
           break
         } catch (error) {
           const errorCode = getErrorCode(error)
@@ -2123,8 +2559,12 @@ app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, a
           provider,
           outcome: captureResult.outcome,
         })
+        throw createAppError("WALLET_CAPTURE_UNCONFIRMED", { outcome: captureResult.outcome })
       }
-      captured = true
+      captured = captureResult.outcome === WALLET_MUTATION.COMMIT || captureResult.outcome === WALLET_MUTATION.DUPLICATE
+      if (!captured) {
+        throw createAppError("WALLET_CAPTURE_UNCONFIRMED", { outcome: captureResult.outcome })
+      }
       balance = captureResult.balance
 
       const storedProviderOrderNumber = resolveStoredProviderOrderNumber(
@@ -2237,25 +2677,27 @@ app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, a
         }
         const currentWallet = await getUserWalletRecord(userId).catch(() => ({ balance }))
 
-        await recordTransaction({
-          userId,
-          type: "purchase",
-          amount: -amount,
-          balance: currentWallet.balance,
-          reference,
-          mutationId: debitMutationId,
-          details: {
-            network,
-            phone,
-            volume: catalogEntry.volume,
-            label: catalogEntry.label,
-            packageId: catalogEntry.id,
-            provider,
-            pendingConfirmation: true,
-          },
-        }).catch((transactionError) => {
-          logger.error("Failed to record pending purchase transaction", transactionError, { userId, reference })
-        })
+        if (captured) {
+          await recordTransaction({
+            userId,
+            type: "purchase",
+            amount: -amount,
+            balance: currentWallet.balance,
+            reference,
+            mutationId: debitMutationId,
+            details: {
+              network,
+              phone,
+              volume: catalogEntry.volume,
+              label: catalogEntry.label,
+              packageId: catalogEntry.id,
+              provider,
+              pendingConfirmation: true,
+            },
+          }).catch((transactionError) => {
+            logger.error("Failed to record pending purchase transaction", transactionError, { userId, reference })
+          })
+        }
 
         const pendingOrderPayload = {
           userId,
@@ -2268,7 +2710,7 @@ app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, a
           provider,
           phone,
           status: "processing",
-          paymentStatus: "wallet_debited",
+          paymentStatus: captured ? "wallet_debited" : "wallet_capture_unconfirmed",
           retryEligible: false,
           errorMessage: pendingMessage,
           providerStatusDescription: pendingMessage,
@@ -2295,7 +2737,7 @@ app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, a
         }
 
         await upsertPurchaseIntent(reference, {
-          paymentStatus: "wallet_debited",
+          paymentStatus: captured ? "wallet_debited" : "wallet_capture_unconfirmed",
           orderStatus: "processing",
           providerSubmissionStatus: "processing",
           provider,
@@ -2373,6 +2815,7 @@ app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, a
           paymentStatus: releaseFailed ? "wallet_hold_stuck" : "wallet_not_charged",
           retryEligible: false,
           providerAttempts: error?.providerAttempts || [],
+          commercialReview: errorCode === "PRICE_FLOOR_BLOCKED" || (error?.providerAttempts || []).some((attempt) => attempt.errorCode === "PRICE_FLOOR_BLOCKED"),
           errorMessage: error.message,
           createdAt: Date.now(),
         }).catch((orderError) => {
@@ -2387,8 +2830,70 @@ app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, a
         }).catch(() => null)
       }
 
+      if (!held && !vendorCompleted) {
+        await upsertPurchaseIntent(reference, {
+          paymentStatus: "wallet_not_charged",
+          orderStatus: "failed",
+          providerSubmissionStatus: "failed",
+          retryEligible: true,
+          errorMessage: error?.message || "Wallet reservation failed",
+        }).catch(() => null)
+        await updateIdempotencyKey(userId, idempotencyKey, { status: "failed", reference }).catch(() => null)
+      }
+
       if (vendorCompleted) {
+        if (!captured) {
+          // The provider may deliver this order. Keep it visible for manual
+          // reconciliation without claiming that the customer was charged.
+          const reviewMessage = "Provider accepted the order, but wallet capture needs review. Contact support with this reference."
+          await createOrderRecord(userId, {
+            userId, reference, packageId: catalogEntry.id, label: catalogEntry.label,
+            volume: catalogEntry.volume, amount, network, provider, phone,
+            status: "processing", paymentStatus: "wallet_capture_unconfirmed",
+            providerReference: providerResult?.providerReference || "",
+            providerOrderNumber: providerResult?.providerOrderNumber || "",
+            providerStatusRaw: providerResult?.providerStatusRaw || "accepted",
+            retryEligible: false, errorMessage: reviewMessage, createdAt: Date.now(),
+            sync: { nextAttemptAt: null, skippedReason: "wallet_capture_unconfirmed" },
+          }).catch((orderError) => logger.error("Failed to store order awaiting wallet capture review", orderError, { userId, reference }))
+          await upsertPurchaseIntent(reference, {
+            paymentStatus: "wallet_capture_unconfirmed", orderStatus: "processing",
+            providerSubmissionStatus: "submitted", provider, retryEligible: false,
+            errorMessage: reviewMessage,
+          }).catch(() => null)
+          await updateIdempotencyKey(userId, idempotencyKey, { status: "indeterminate", reference }).catch(() => null)
+          return res.status(202).json({
+            status: "success", message: reviewMessage,
+            data: { reference, orderStatus: "processing", amount, phone, network,
+              volume: catalogEntry.volume, label: catalogEntry.label, packageId: catalogEntry.id },
+            timestamp: new Date().toISOString(),
+          })
+        }
         logger.error("Purchase completed but local persistence failed", error, { userId, network, reference })
+        const recoveryMessage = "Provider accepted this order, but confirmation storage needs review. Contact support with this reference."
+        await recordTransaction({
+          userId, type: "purchase", amount: -amount, balance, reference,
+          mutationId: debitMutationId,
+          details: { network, phone, volume: catalogEntry.volume, label: catalogEntry.label, packageId: catalogEntry.id },
+        }).catch((transactionError) => logger.error("Failed to recover captured purchase ledger entry", transactionError, { userId, reference }))
+        const existingOrder = await findOrderLocationByReference(reference, { includeOrder: true }).catch(() => null)
+        if (!existingOrder) {
+          await createOrderRecord(userId, {
+            userId, reference, packageId: catalogEntry.id, label: catalogEntry.label,
+            volume: catalogEntry.volume, amount, network, provider, phone,
+            status: "processing", paymentStatus: "wallet_debited",
+            providerReference: providerResult?.providerReference || "",
+            providerOrderNumber: providerResult?.providerOrderNumber || "",
+            providerStatusRaw: providerResult?.providerStatusRaw || "accepted",
+            retryEligible: false, errorMessage: recoveryMessage, createdAt: Date.now(),
+          }).catch((orderError) => logger.error("Failed to store order awaiting confirmation review", orderError, { userId, reference }))
+        }
+        await upsertPurchaseIntent(reference, {
+          paymentStatus: "wallet_debited", orderStatus: existingOrder?.order?.status || "processing",
+          providerSubmissionStatus: "submitted", provider, retryEligible: false,
+          errorMessage: recoveryMessage,
+        }).catch(() => null)
+        await updateIdempotencyKey(userId, idempotencyKey, { status: "indeterminate", reference }).catch(() => null)
         return res.status(500).json({
           status: "error",
           message: `Purchase completed but confirmation storage failed. Contact support with reference ${reference}.`,
@@ -2420,69 +2925,10 @@ app.post("/api/wallet-purchase", authenticateRequest, purchaseActionRateLimit, a
         })
       }
 
-      if (errorCode === "INSUFFICIENT_HUBNET_BALANCE") {
+      if (/HUBNET|GODSWAY|GIGSHUB|PBMHUB|PROVIDER|NETWORK_PAUSED|PRICE_FLOOR/.test(errorCode)) {
         return res.status(503).json({
           status: "error",
-          errorCode: "INSUFFICIENT_HUBNET_BALANCE",
-          message: "Service provider has insufficient balance",
-          timestamp: new Date().toISOString(),
-        })
-      }
-
-      if (errorCode === "INSUFFICIENT_GODSWAY_BALANCE") {
-        return res.status(503).json({
-          status: "error",
-          errorCode: "INSUFFICIENT_GODSWAY_BALANCE",
-          message: "Service provider has insufficient balance",
-          timestamp: new Date().toISOString(),
-        })
-      }
-
-      if (errorCode === "HUBNET_AUTH_FAILED") {
-        return res.status(502).json({
-          status: "error",
-          errorCode: "HUBNET_AUTH_FAILED",
-          message: error.providerMessage || "Hubnet API authentication failed. Update HUBNET_API_KEY.",
-          timestamp: new Date().toISOString(),
-        })
-      }
-
-      if (errorCode === "GODSWAY_AUTH_FAILED") {
-        return res.status(502).json({
-          status: "error",
-          errorCode: "GODSWAY_AUTH_FAILED",
-          message: error.providerMessage || "Godsway API authentication failed. Update GODSWAY_API_KEY.",
-          timestamp: new Date().toISOString(),
-        })
-      }
-
-      if (errorCode === "HUBNET_RATE_LIMITED") {
-        return res.status(429).json({
-          status: "error",
-          errorCode: "HUBNET_RATE_LIMITED",
-          message: error.providerMessage || "Hubnet API rate limit reached. Please try again shortly.",
-          timestamp: new Date().toISOString(),
-        })
-      }
-
-      if (errorCode === "GODSWAY_RATE_LIMITED") {
-        return res.status(429).json({
-          status: "error",
-          errorCode: "GODSWAY_RATE_LIMITED",
-          message: error.providerMessage || "Godsway API rate limit reached. Please try again shortly.",
-          timestamp: new Date().toISOString(),
-        })
-      }
-
-      // PBM HUB names every failure with its own code, and the shared provider
-      // helpers already map each one to a status and a customer-safe message.
-      // Routing them through those keeps the two lists from drifting apart, so
-      // a new upstream code cannot quietly degrade into a generic 500.
-      if (errorCode === "INSUFFICIENT_PBMHUB_BALANCE" || errorCode.startsWith("PBMHUB_")) {
-        return res.status(getProviderErrorHttpStatus(errorCode)).json({
-          status: "error",
-          errorCode,
-          message: getProviderErrorMessage(error, errorCode, "Failed to process data bundle"),
+          message: "This bundle cannot be delivered right now. Please try again shortly.",
           timestamp: new Date().toISOString(),
         })
       }
@@ -2809,7 +3255,7 @@ app.post("/api/reset-circuit-breaker/:service", authenticateRequest, requirePriv
   })
 })
 
-app.post("/api/initiate-payment", authenticateRequest, purchaseActionRateLimit, async (req, res) => {
+app.post("/api/initiate-payment", authenticateRequest, purchaseActionRateLimit, purchaseVelocityRateLimit, async (req, res) => {
   const authUserId = req.authUser.uid
   const authEmail = String(req.authUser.email || "").trim()
   const { network, phone, volume, amount, email, fcmToken, paymentType, reference, packageId } = req.body
@@ -2856,11 +3302,18 @@ app.post("/api/initiate-payment", authenticateRequest, purchaseActionRateLimit, 
       })
     }
 
+    if (!isNetworkAvailable(await getVendingControls(), normalizedNetwork)) {
+      return res.status(503).json({ status: "error", message: "This network is back shortly. Please try another network." })
+    }
+
     if (!/^\d{10}$/.test(normalizedPhone)) {
       return res.status(400).json({
         status: "error",
         message: "Invalid phone number format",
       })
+    }
+    if (isRecipientBlocked(normalizedPhone) || isIdentityBlocked(authUserId) || assessRecipientVelocity(authUserId, normalizedPhone)) {
+      return res.status(403).json({ status: "error", message: "This recipient number cannot be processed at this time." })
     }
 
     const catalogEntry = await getCatalogPackage(normalizedNetwork, { packageId: normalizedPackageId })
@@ -2874,7 +3327,15 @@ app.post("/api/initiate-payment", authenticateRequest, purchaseActionRateLimit, 
 
     normalizedLabel = catalogEntry.label
     normalizedVolume = Number(catalogEntry.volume || 0)
-    normalizedAmount = await getEffectivePackagePrice(catalogEntry, authUserId)
+    const paymentRoute = await getProviderRouteForNetwork(normalizedNetwork)
+    normalizedAmount = await getEffectivePackagePrice(catalogEntry, authUserId, { provider: paymentRoute[0] })
+    const costCheck = await evaluateSaleGuard({
+      network: normalizedNetwork, packageId: catalogEntry.id,
+      provider: paymentRoute[0], price: normalizedAmount,
+    })
+    if (!costCheck.allowed) {
+      return res.status(503).json({ status: "error", message: "This bundle is temporarily unavailable. Please try again shortly." })
+    }
 
     if (Number(volume || 0) && Number(volume || 0) !== normalizedVolume) {
       await recordAuditEvent({
@@ -2935,7 +3396,10 @@ app.post("/api/initiate-payment", authenticateRequest, purchaseActionRateLimit, 
             ? "AT_DATA"
             : "TELECEL_DATA"
 
-    const paymentReference = reference || generateReference(prefix)
+    // Always minted here. A client-chosen reference could name another user's
+    // pending deposit or intent, and references double as receipt capabilities.
+    void reference
+    const paymentReference = generateReference(prefix)
     const amountInKobo = Math.round(numAmount * 100)
 
     const payload = {
@@ -2960,7 +3424,20 @@ app.post("/api/initiate-payment", authenticateRequest, purchaseActionRateLimit, 
       },
     }
 
-    if (paymentType !== "wallet") {
+    if (paymentType === "wallet") {
+      await db.ref(`deposits/${paymentReference}`).set({
+        reference: paymentReference,
+        userId: authUserId,
+        amount: toMoneyNumber(numAmount, 0),
+        status: "pending",
+        channel: "paystack",
+        createdAt: Date.now(),
+        metadata: {
+          email: paymentOwnerEmail,
+          fcmToken: fcmToken || null,
+        },
+      }).catch((err) => logger.warn("Failed to record pending deposit intent", { reference: paymentReference, error: err?.message }))
+    } else {
       payload.metadata.network = normalizedNetwork
       payload.metadata.phone = normalizedPhone
       payload.metadata.volume = normalizedVolume
@@ -3089,7 +3566,27 @@ app.get("/api/verify-payment/:reference", authenticateRequest, paymentVerificati
     })
   }
 
+  let verificationLease = null
   try {
+    if (isValidRepairReference(reference)) {
+      verificationLease = await claimRepairLease(reference)
+      if (!verificationLease) {
+        return res.status(409).json({ status: "pending", message: "This order is already being checked. Please try again shortly." })
+      }
+      // Re-read under the lease. Another path (the webhook-driven repair
+      // pipeline, a second tab) may have created and dispatched this order
+      // since the unlocked read above; dispatching again would double-deliver.
+      const lockedOrder = await findOrderLocationByReference(reference, { includeOrder: true }).catch(() => null)
+      if (lockedOrder?.order) {
+        const order = normalizeStoredOrderRecord(lockedOrder.order)
+        return res.json({
+          status: "success",
+          message: "Transaction already processed",
+          data: { reference, alreadyProcessed: true, orderStatus: order.status, amount: toMoneyNumber(order.amount, 0) },
+          timestamp: new Date().toISOString(),
+        })
+      }
+    }
     logger.debug("Verifying payment with Paystack", { reference })
     const verifyData = await verifyPaystackPayment(reference)
 
@@ -3160,6 +3657,9 @@ app.get("/api/verify-payment/:reference", authenticateRequest, paymentVerificati
           timestamp: new Date().toISOString(),
         })
       }
+      if (isRecipientBlocked(phone) || isIdentityBlocked(userId)) {
+        return res.status(403).json({ status: "error", message: "This recipient number cannot be processed at this time." })
+      }
 
       if (purchaseIntent) {
         const intentAmount = toMoneyNumber(purchaseIntent.amount, 0)
@@ -3186,8 +3686,7 @@ app.get("/api/verify-payment/:reference", authenticateRequest, paymentVerificati
         })
       }
 
-      const provider = existingOrderLocation?.order?.provider || (await getActiveProviderForNetwork(network))
-      const providerAdapter = getProviderAdapter(provider)
+      let provider = existingOrderLocation?.order?.provider || (await getActiveProviderForNetwork(network))
       const intentClaim = await claimPurchaseIntentProcessing(reference, `verify:${INSTANCE_ID}`)
       if (purchaseIntent && !intentClaim.claimed && ["submitted", "completed", "processing"].includes(intentClaim.intent?.providerSubmissionStatus)) {
         if (existingOrderLocation?.order) {
@@ -3217,13 +3716,26 @@ app.get("/api/verify-payment/:reference", authenticateRequest, paymentVerificati
 
       try {
         logger.debug("Processing provider transaction for verified payment", { reference, network, provider })
-        const providerResult = await providerAdapter.purchase({
-          network,
-          phone,
-          reference,
-          catalogEntry,
-          amount: paymentAmount,
-        })
+        const { candidates } = await resolvePurchaseProviderCandidates(network, catalogEntry)
+        const orderedCandidates = [
+          ...candidates.filter((candidate) => candidate.provider === provider),
+          ...candidates.filter((candidate) => candidate.provider !== provider),
+        ]
+        let providerResult = null
+        let lastFailure = null
+        for (const candidate of orderedCandidates) {
+          provider = candidate.provider
+          try {
+            providerResult = await dispatchGuarded({ provider, network, catalogEntry, amount: paymentAmount, purchase: () => getProviderAdapter(provider).purchase({
+              network, phone, reference, catalogEntry, amount: paymentAmount,
+            }) })
+            break
+          } catch (error) {
+            if (isIndeterminateProviderSubmissionError(error)) throw error
+            lastFailure = preferInformativeProviderFailure(lastFailure, error)
+          }
+        }
+        if (!providerResult) throw lastFailure || createAppError("NO_PROVIDER_ROUTED")
 
         const storedProviderOrderNumber = resolveStoredProviderOrderNumber(
           provider,
@@ -3304,14 +3816,13 @@ app.get("/api/verify-payment/:reference", authenticateRequest, paymentVerificati
         logger.error("Provider processing failed for verified payment", providerError, { reference, provider })
         const errorCode = getErrorCode(providerError)
         const indeterminateProviderFailure = isIndeterminateProviderSubmissionError(providerError)
-        const message = indeterminateProviderFailure
+        const message = errorCode === "PRICE_FLOOR_BLOCKED"
+          ? "This order needs a pricing review before delivery. Your payment is recorded."
+          : indeterminateProviderFailure
           ? getIndeterminateProviderSubmissionMessage(provider)
-          : getProviderErrorMessage(
-              providerError,
-              errorCode,
-              "Payment successful but data bundle processing failed",
-            )
-        const nextAttemptAt = indeterminateProviderFailure ? null : Date.now() + CONFIG.orderSyncRetryDelayMs
+          : "Your payment is recorded. Delivery is pending; please check your order shortly."
+        const commercialHold = errorCode === "PRICE_FLOOR_BLOCKED"
+        const nextAttemptAt = indeterminateProviderFailure || commercialHold ? null : Date.now() + CONFIG.orderSyncRetryDelayMs
         const pendingPayload = {
           userId,
           reference,
@@ -3324,7 +3835,8 @@ app.get("/api/verify-payment/:reference", authenticateRequest, paymentVerificati
           phone,
           status: indeterminateProviderFailure ? "processing" : "pending",
           paymentStatus: "success",
-          retryEligible: indeterminateProviderFailure ? false : true,
+          retryEligible: indeterminateProviderFailure || commercialHold ? false : true,
+          commercialReview: commercialHold,
           errorMessage: message,
           providerStatusDescription: message,
           statusSource: indeterminateProviderFailure ? "provider_submission_pending" : "payment_verify",
@@ -3335,7 +3847,7 @@ app.get("/api/verify-payment/:reference", authenticateRequest, paymentVerificati
             lastAttemptAt: Date.now(),
             lastError: message,
             nextAttemptAt,
-            skippedReason: indeterminateProviderFailure ? "provider_submission_indeterminate" : "",
+            skippedReason: commercialHold ? "price_floor_review" : indeterminateProviderFailure ? "provider_submission_indeterminate" : "",
           },
         }
 
@@ -3349,14 +3861,14 @@ app.get("/api/verify-payment/:reference", authenticateRequest, paymentVerificati
           orderStatus: indeterminateProviderFailure ? "processing" : "pending",
           providerSubmissionStatus: indeterminateProviderFailure ? "processing" : "failed",
           provider,
-          retryEligible: indeterminateProviderFailure ? false : true,
+          retryEligible: indeterminateProviderFailure || commercialHold ? false : true,
           errorMessage: message,
         }).catch(() => null)
 
         return res.status(indeterminateProviderFailure ? 202 : 200).json({
           status: "pending",
           paymentStatus: "success",
-          errorCode: errorCode || undefined,
+          errorCode: commercialHold ? "PRICING_REVIEW" : "DELIVERY_PENDING",
           message,
           data: {
             reference: paymentData.reference,
@@ -3421,316 +3933,290 @@ app.get("/api/verify-payment/:reference", authenticateRequest, paymentVerificati
       timestamp: new Date().toISOString(),
     })
   } finally {
+    if (verificationLease) {
+      await releaseRepairLease(reference, verificationLease).catch((error) => logger.error("Verification lease release failed", error, { reference }))
+    }
     releaseTransactionLock(reference)
   }
 })
 
-app.post("/api/retry-transaction/:reference", authenticateRequest, purchaseActionRateLimit, async (req, res) => {
-  const { reference } = req.params
-  const { network, phone, volume } = req.body
-
-  logger.info("Transaction retry request", { reference, network, phone, volume })
-
-  if (!reference) {
-    return res.status(400).json({
-      status: "error",
-      message: "Missing required reference",
-    })
+/**
+ * The 7-step self-healing repair pipeline, independent of HTTP so it can run
+ * from a customer's Repair button, the receipt page, or a Paystack webhook
+ * for a buyer who paid and closed the tab. Returns { code, body }.
+ *
+ * `requesterUid` is the signed-in caller ("" for guests). Server-side callers
+ * pass the payer uid from a signature-verified Paystack event.
+ */
+async function runRepairPipeline({ reference, requesterUid: rawRequesterUid = "" }) {
+  const reply = (code, body) => ({ code, body })
+  if (!isValidRepairReference(reference)) {
+    return reply(400, { status: "error", message: "Enter a valid order or payment reference." })
   }
 
-  // Acquire lock for retry
-  if (!acquireTransactionLock(reference)) {
-    return res.status(409).json({
-      status: "error",
-      message: "Transaction is currently being processed",
-      retryAfter: 3,
-    })
+  const leaseToken = await claimRepairLease(reference)
+  if (!leaseToken) {
+    return reply(409, { status: "pending", message: "This order is already being checked. Please check its status shortly." })
   }
-
-  // Mirrored out of the try block: the catch needs them to describe the order
-  // when a submission comes back indeterminate, and the originals are block
-  // scoped to the try.
-  let retryProvider = ""
-  let retryNetwork = ""
-  let retryPhone = ""
 
   try {
-    const existingOrderLocation = await findOrderLocationByReference(reference, { includeOrder: true })
-    const purchaseIntent = await getPurchaseIntent(reference)
-    const requesterRole = await getUserRoleSummary(req.authUser.uid)
-    const ownerUid = String(existingOrderLocation?.userId || purchaseIntent?.userId || "").trim()
-    const retryEligible =
-      (existingOrderLocation?.order?.retryEligible ?? purchaseIntent?.retryEligible ?? true) !== false
-    if (ownerUid && ownerUid !== req.authUser.uid && requesterRole.admin !== true) {
-      return res.status(403).json({
-        status: "error",
-        message: "You are not allowed to retry this transaction",
-        timestamp: new Date().toISOString(),
-      })
+    let located = await findOrderLocationByReference(reference, { includeOrder: true })
+    let intent = await getPurchaseIntent(reference)
+    const order = located?.order || null
+    const ownerUid = String(located?.userId || intent?.userId || "")
+    const guest = order?.isGuest === true || intent?.type === "guest_bundle"
+    const requesterUid = String(rawRequesterUid || "")
+    if (ownerUid && !guest && requesterUid !== ownerUid) {
+      return reply(404, { status: "error", message: "Order not found for this account." })
     }
 
-    if (!retryEligible) {
-      return res.status(409).json({
-        status: "error",
-        message: "This transaction is awaiting confirmation already and cannot be retried yet.",
-        timestamp: new Date().toISOString(),
-      })
+    const knownState = classifyRepairState(order || {}, intent || {})
+    if (!guest && knownState === "refunded") {
+      return reply(409, { status: "error", message: "This order was already refunded to your balance." })
+    }
+    if (!guest && knownState === "delivered") {
+      if (order?.storefrontSlug) await settleStorefrontProfit(order).catch((error) => logger.error("Store profit settlement failed", error, { reference }))
+      return reply(200, { status: "success", message: "This order was already delivered.", data: order ? toPublicOrderRecord(order) : { reference, status: "delivered" } })
     }
 
-    const verifyData = await verifyPaystackPayment(reference)
-
-    if (!verifyData.status || verifyData.data.status !== "success") {
-      return res.status(400).json({
-        status: "error",
-        message: "Cannot retry transaction - payment not successful",
-      })
-    }
-
-    const paymentData = verifyData.data
-    const metadata = paymentData.metadata || {}
-    const safeNetwork = normalizePurchaseNetwork(existingOrderLocation?.order?.network || purchaseIntent?.network || network || metadata.network)
-    const safePhone = sanitizePhoneNumber(existingOrderLocation?.order?.phone || purchaseIntent?.phone || phone || metadata.phone)
-    const safeVolume = Number(existingOrderLocation?.order?.volume || purchaseIntent?.volume || volume || metadata.volume || 0)
-
-    if (!safeNetwork || !safePhone || !safeVolume) {
-      return res.status(400).json({
-        status: "error",
-        message: "Missing required retry parameters",
-      })
-    }
-
-    // Starts at whoever originally took the order, then moves down the route as
-    // the failover loop below tries each candidate.
-    let provider = existingOrderLocation?.order?.provider || (await getActiveProviderForNetwork(safeNetwork))
-    retryProvider = provider
-    retryNetwork = safeNetwork
-    retryPhone = safePhone
-    const intentClaim = await claimPurchaseIntentProcessing(reference, `retry:${INSTANCE_ID}`)
-    if (purchaseIntent && !intentClaim.claimed && ["submitted", "completed", "processing"].includes(intentClaim.intent?.providerSubmissionStatus)) {
-      return res.status(409).json({
-        status: "error",
-        message: "This transaction is already being processed",
-        retryAfter: 3,
-        timestamp: new Date().toISOString(),
-      })
-    }
-    const catalogEntry =
-      (await getCatalogPackage(safeNetwork, {
-        packageId: existingOrderLocation?.order?.packageId || purchaseIntent?.packageId || metadata.packageId || "",
-        volume: safeVolume,
-      })) || normalizeCatalogEntry(
-        {
-          id: existingOrderLocation?.order?.packageId || purchaseIntent?.packageId || `${safeNetwork}-${safeVolume}`,
-          label: existingOrderLocation?.order?.label || purchaseIntent?.label || defaultPackageLabel(safeVolume),
-          volume: safeVolume,
-          userPrice: paymentData.amount / 100,
-          agentPrice: paymentData.amount / 100,
-          providerMappings: existingOrderLocation?.order?.providerMappings || {},
-        },
-        existingOrderLocation?.order?.packageId || purchaseIntent?.packageId || `${safeNetwork}-${safeVolume}`,
-        safeNetwork,
-      )
-
-    if (!catalogEntry) {
-      return res.status(400).json({
-        status: "error",
-        message: "No matching package configuration was found for this retry.",
-      })
-    }
-
-    let existingData = null
-    if (processedTransactions.has(reference)) {
-      existingData = processedTransactions.get(reference)
-      processedTransactions.add(reference, {
-        ...existingData,
-        retryAttempted: true,
-        retryTimestamp: Date.now(),
-      })
-    }
-
-    // Providers that key idempotency on our reference would replay the original
-    // outcome, and for a failed order that stored outcome IS the failure - the
-    // retry would return a cached rejection forever instead of placing a new
-    // order. Only this path may mint a fresh key, and only because an order that
-    // is merely awaiting confirmation carries retryEligible: false and was
-    // already refused above, so anything reaching here is definitively dead.
-    // Derived from the attempt count so it is stable within one retry and
-    // distinct across retries; a repeat means a replay, which is the safe way
-    // to be wrong.
-    const retryAttempt = Number(existingOrderLocation?.order?.sync?.attempts || 0) + 1
-    const providerIdempotencyKey = `${reference}:retry:${retryAttempt}`
-
-    // The retry walks the same route a fresh purchase would, starting from the
-    // provider this order was originally placed with. A definitive refusal moves
-    // to the next provider; an uncertain one stops the chain and is handled by
-    // the catch below, which keeps the order pending rather than re-dispatching
-    // something that may already be live.
-    const { candidates: retryCandidates } = await resolvePurchaseProviderCandidates(safeNetwork, catalogEntry)
-    const orderedRetryCandidates = [
-      ...retryCandidates.filter((candidate) => candidate.provider === provider),
-      ...retryCandidates.filter((candidate) => candidate.provider !== provider),
-    ]
-
-    if (!orderedRetryCandidates.length) {
-      return res.status(503).json({
-        status: "error",
-        errorCode: "NO_PROVIDER_ROUTED",
-        message: "No provider is currently able to fulfil this order.",
-        timestamp: new Date().toISOString(),
-      })
-    }
-
-    let providerResult = null
-    let retryFailure = null
-
-    for (const [index, candidate] of orderedRetryCandidates.entries()) {
-      provider = candidate.provider
-      retryProvider = provider
-      try {
-        providerResult = await getProviderAdapter(provider).purchase({
-          network: safeNetwork,
-          phone: safePhone,
-          reference,
-          catalogEntry,
-          amount: paymentData.amount / 100,
-          providerIdempotencyKey,
-          hasNextProvider: hasCandidateAfter(orderedRetryCandidates, index),
-        })
-        break
-      } catch (error) {
-        if (isIndeterminateProviderSubmissionError(error)) {
-          throw error
-        }
-
-        logger.warn("Provider refused a retry", {
-          reference,
-          provider,
-          errorCode: getErrorCode(error),
-          remaining: orderedRetryCandidates.length - index - 1,
-        })
-        retryFailure = preferInformativeProviderFailure(retryFailure, error)
+    const paymentStatus = String(order?.paymentStatus || intent?.paymentStatus || "").toLowerCase()
+    const walletPurchase = intent?.type === "wallet_purchase" || ["wallet_debited", "wallet_debited_pending", "wallet_capture_unconfirmed", "wallet_not_charged", "wallet_refunded", "refunded"].includes(paymentStatus)
+    let payment = null
+    if (!walletPurchase) {
+      const verified = await verifyPaystackPayment(reference)
+      payment = verified?.status && verified?.data?.status === "success" ? verified.data : null
+      if (!payment || String(payment.reference || "") !== reference || String(payment.currency || "").toUpperCase() !== "GHS") {
+        return reply(409, { status: "pending", message: "Payment is not confirmed yet. Please check again shortly." })
+      }
+      const metadata = payment.metadata || {}
+      if (String(metadata.paymentType || "").toLowerCase() === "wallet") {
+        return reply(400, { status: "error", message: "This reference is for a wallet deposit, not a data order." })
+      }
+      if (ownerUid && metadata.userId && metadata.userId !== ownerUid && !guest) {
+        return reply(409, { status: "error", message: "Payment details do not match this order." })
+      }
+      if (!ownerUid && metadata.userId && metadata.userId !== requesterUid) {
+        return reply(404, { status: "error", message: "Order not found for this account." })
+      }
+      if (!ownerUid && !metadata.userId && (String(metadata.paymentType || "").toLowerCase() !== "guest_bundle" || reference.length < 24)) {
+        return reply(404, { status: "error", message: "Order not found." })
+      }
+      if (guest && String(metadata.paymentType || "").toLowerCase() !== "guest_bundle") {
+        return reply(409, { status: "error", message: "Payment details do not match this guest order." })
+      }
+      const expectedAmount = Number(order?.amount || intent?.amount || 0)
+      if (expectedAmount > 0 && toMoneyUnits(expectedAmount) !== Number(payment.amount || 0)) {
+        return reply(409, { status: "error", message: "Payment amount does not match this order. Support will review it." })
       }
     }
 
-    if (!providerResult) {
-      throw (
-        retryFailure ||
-        createAppError("PROVIDER_PURCHASE_FAILED", { providerMessage: "No provider accepted this retry." })
-      )
+    const currentState = classifyRepairState(order || {}, intent || {})
+    if (currentState === "refunded") {
+      return reply(409, { status: "error", message: "This order was already refunded to your balance." })
+    }
+    if (currentState === "delivered") {
+      if (order?.storefrontSlug) await settleStorefrontProfit(order).catch((error) => logger.error("Store profit settlement failed", error, { reference }))
+      await queueRepairConfirmation({ reference, phone: order?.phone || intent?.phone, userId: located?.userId || ownerUid, guest }).catch(() => null)
+      return reply(200, { status: "success", message: "This order was already delivered.", data: toPublicOrderRecord(order) })
+    }
+    if (walletPurchase && !["success", "wallet_debited", "wallet_debited_pending", "wallet_capture_unconfirmed"].includes(paymentStatus)) {
+      return reply(409, { status: "error", message: "This wallet order has not been charged." })
     }
 
-    const storedProviderOrderNumber = resolveStoredProviderOrderNumber(
-      provider,
-      providerResult.providerOrderNumber || null,
-      reference,
-    )
-    const storedProviderReference = resolveStoredProviderReference(
-      provider,
-      providerResult.providerReference || "",
-      reference,
-      storedProviderOrderNumber || "",
-    )
-
-    logger.info("Transaction retry successful", {
-      reference,
-      provider,
-      providerOrderNumber: storedProviderOrderNumber,
-    })
-
-    const retryOrderPayload = mergeOrderPayloadWithPurchaseIntent({
-      network: safeNetwork,
-      provider,
-      phone: safePhone,
-      volume: catalogEntry.volume,
-      label: catalogEntry.label,
-      packageId: catalogEntry.id,
-      amount: paymentData.amount / 100,
-      status: providerResult.status || "accepted",
-      providerReference: storedProviderReference,
-      providerOrderNumber: storedProviderOrderNumber,
-      providerStatusRaw: providerResult.providerStatusRaw || "accepted",
-      providerStatusDescription: providerResult.providerStatusDescription || "",
-      providerMeta: providerResult.providerMeta || {},
-      providerResponse: providerResult.providerResponse || null,
-      statusSource: "retry",
-      statusUpdatedAt: Date.now(),
-      updatedAt: Date.now(),
-      sync: {
-        attempts: Number(existingOrderLocation?.order?.sync?.attempts || 0) + 1,
-        lastAttemptAt: Date.now(),
-        lastSuccessAt: Date.now(),
-        lastError: "",
-        nextAttemptAt: Date.now() + CONFIG.orderSyncRetryDelayMs,
-        lastProviderStatusRaw: providerResult.providerStatusRaw || "",
-      },
-    }, purchaseIntent)
-    const retryUpdateResult = await updateOrderByReference(reference, retryOrderPayload)
-    await syncPurchaseIntentFromOrder(reference, retryUpdateResult.order || retryOrderPayload, {
-      paymentStatus: "success",
-      retryEligible: true,
-      errorMessage: "",
-    }).catch(() => null)
-
-    res.json({
-      status: "success",
-      message: "Transaction retry completed",
-      data: {
-        reference,
-        phone: safePhone,
-        volume: catalogEntry.volume,
-        network: safeNetwork,
-        orderStatus: retryUpdateResult.order?.status || retryOrderPayload.status || providerResult.status || "accepted",
-        timestamp: Date.now(),
-        previousAttempt: existingData ? true : false,
-      },
-      timestamp: new Date().toISOString(),
-    })
-  } catch (error) {
-    logger.error("Transaction retry failed", error, { reference })
-    const errorCode = getErrorCode(error)
-
-    // An indeterminate submission is not a failure: the provider may have
-    // accepted the order and simply not told us in time. Marking the intent
-    // "failed" here would advertise it as retryable, and retrying an order that
-    // is already live delivers - and charges for - the bundle twice.
-    if (isIndeterminateProviderSubmissionError(error)) {
-      const pendingMessage = getIndeterminateProviderSubmissionMessage(retryProvider)
-      await upsertPurchaseIntent(reference, {
-        providerSubmissionStatus: "processing",
-        retryEligible: false,
-        errorMessage: pendingMessage,
-      }).catch(() => null)
-
-      return res.status(202).json({
-        status: "success",
-        message: pendingMessage,
-        data: {
-          reference,
-          phone: retryPhone,
-          network: retryNetwork,
-          orderStatus: "processing",
-          timestamp: Date.now(),
-        },
-        timestamp: new Date().toISOString(),
+    if (!located) {
+      const metadata = payment?.metadata || {}
+      const network = normalizePurchaseNetwork(intent?.network || metadata.network || metadata.carrier)
+      const phone = sanitizePhoneNumber(intent?.phone || metadata.phone || metadata.recipient || metadata.recipient_phone)
+      const packageId = String(intent?.packageId || metadata.packageId || metadata.plan_id || metadata.bundle_id || "")
+      const catalogEntry = await getCatalogPackage(network, { packageId, volume: Number(intent?.volume || metadata.volume || 0) })
+      if (!catalogEntry || phone.length !== 10 || !SUPPORTED_PACKAGE_NETWORKS.includes(network)) {
+        return reply(409, { status: "pending", message: "Payment is confirmed. The order needs a catalog review before delivery." })
+      }
+      const amount = Number(payment.amount || 0) / 100
+      const isGuest = intent?.type === "guest_bundle" || (!ownerUid && !metadata.userId)
+      const uid = isGuest
+        ? `guest_${crypto.createHash("sha256").update(reference).digest("hex").slice(0, 24)}`
+        : ownerUid || requesterUid
+      const provider = intent?.provider || (await getActiveProviderForNetwork(network))
+      if (!intent && (toMoneyUnits(amount) < toMoneyUnits(resolveUserPrice(catalogEntry, { provider })) ||
+        (Number(metadata.volume || 0) > 0 && Number(metadata.volume) !== Number(catalogEntry.volume)))) {
+        return reply(409, { status: "error", message: "Payment details need review before this bundle can be delivered." })
+      }
+      const previouslySubmitted = ["processing", "submitted", "completed"].includes(intent?.providerSubmissionStatus)
+      const created = await createOrderRecord(uid, {
+        reference, userId: uid, isGuest, network, phone, packageId: catalogEntry.id,
+        label: catalogEntry.label, volume: catalogEntry.volume, amount, provider,
+        status: previouslySubmitted ? "processing" : "failed",
+        paymentStatus: "success", retryEligible: !previouslySubmitted,
+        providerReference: intent?.providerReference || "", providerOrderNumber: intent?.providerOrderNumber || "",
+        storefrontSlug: intent?.storefrontSlug || metadata.storefrontSlug || "",
+        storefrontOwnerUid: intent?.storefrontOwnerUid || metadata.storefrontOwnerUid || "",
+        storefrontWholesale: Number(intent?.storefrontWholesale || metadata.storefrontWholesale || 0),
+        statusSource: "repair_reconstruction", createdAt: Date.now(),
+      })
+      located = { userId: uid, orderId: created.id, order: created }
+      intent = await upsertPurchaseIntent(reference, {
+        userId: uid, type: isGuest ? "guest_bundle" : "bundle",
+        network, phone, packageId: catalogEntry.id, volume: catalogEntry.volume,
+        label: catalogEntry.label, amount, paymentStatus: "success",
+        orderStatus: created.status, provider, retryEligible: !previouslySubmitted,
+        storefrontSlug: created.storefrontSlug, storefrontOwnerUid: created.storefrontOwnerUid,
+        storefrontWholesale: created.storefrontWholesale,
       })
     }
 
-    const statusCode = getProviderErrorHttpStatus(errorCode)
-    const message = getProviderErrorMessage(error, errorCode, "Transaction retry failed")
-    await upsertPurchaseIntent(reference, {
-      providerSubmissionStatus: "failed",
-      errorMessage: message,
-    }).catch(() => null)
+    let liveOrder = located.order
+    const provider = normalizeProvider(liveOrder.provider, "")
+    let upstream = null
+    if (provider) {
+      try {
+        upstream = await getProviderAdapter(provider).getOrderStatus(liveOrder)
+      } catch (error) {
+        logger.warn("Repair status check unavailable", { reference, provider, errorCode: getErrorCode(error) })
+      }
+    }
+    const upstreamStatus = upstream?.supported === false ? "" : normalizeInternalOrderStatus(upstream?.status, "")
+    const upstreamFailed = hasDefinitiveProviderFailure(upstream)
+    if (upstreamStatus === "delivered") {
+      const applied = await updateOrderByReference(reference, {
+        status: "delivered", statusSource: "repair_reconciliation", statusUpdatedAt: Date.now(),
+        deliveredAt: Date.now(), repairedAt: Date.now(), retryEligible: false,
+        providerStatusRaw: upstream.providerStatusRaw || "delivered",
+        providerReference: upstream.providerReference || liveOrder.providerReference || "",
+        providerOrderNumber: upstream.providerOrderNumber || liveOrder.providerOrderNumber || "",
+        repairDispatchClaim: null,
+      }, { manual: true })
+      await syncPurchaseIntentFromOrder(reference, applied.order).catch(() => null)
+      if (applied.order?.storefrontSlug) await settleStorefrontProfit(applied.order).catch((error) => logger.error("Store profit settlement failed", error, { reference }))
+      await queueRepairConfirmation({ reference, phone: applied.order?.phone, userId: located.userId, guest: applied.order?.isGuest === true }).catch(() => null)
+      runRepairNotificationQueue().catch((error) => logger.error("Repair notification send failed", error, { reference }))
+      return reply(200, { status: "success", message: "Delivery confirmed.", data: toPublicOrderRecord(applied.order) })
+    }
+    if (upstreamStatus && !["failed", "cancelled"].includes(upstreamStatus)) {
+      await updateOrderByReference(reference, { status: upstreamStatus, statusSource: "repair_reconciliation", statusUpdatedAt: Date.now() })
+      return reply(202, { status: "pending", message: "This order is still being processed. Please check again shortly.", data: { reference, orderStatus: upstreamStatus } })
+    }
 
-    res.status(statusCode).json({
-      status: "error",
-      errorCode: errorCode || undefined,
-      message,
-      timestamp: new Date().toISOString(),
-    })
+    const previousState = classifyRepairState(liveOrder, intent || {})
+    if (intent?.providerSubmissionStatus === "processing" && Number(intent.processingExpiresAt || 0) > Date.now()) {
+      return reply(202, { status: "pending", message: "The original delivery is still being processed. Please check again shortly.", data: { reference, orderStatus: liveOrder.status } })
+    }
+    if (!canRedispatchAfterStatus({ previousState, upstream, order: liveOrder, intent: intent || {} })) {
+      return reply(202, { status: "pending", message: "We are checking the original delivery before trying again.", data: { reference, orderStatus: liveOrder.status } })
+    }
+    if (isRecipientBlocked(liveOrder.phone) || (!guest && isIdentityBlocked(ownerUid))) {
+      return reply(403, { status: "error", message: "This recipient number cannot be processed at this time." })
+    }
+    const originalWasSubmitted = Boolean(upstreamFailed || hasProviderSubmissionEvidence(liveOrder, intent || {}))
+    if (upstreamFailed) {
+      const failed = await updateOrderByReference(reference, { status: "failed", retryEligible: true, repairDispatchClaim: null, statusSource: "repair_reconciliation" }, { manual: true })
+      liveOrder = failed.order
+    }
+    const claimed = await claimRepairDispatch({ userId: located.userId, orderId: located.orderId, token: leaseToken, fallbackOrder: liveOrder })
+    if (!claimed) {
+      return reply(202, { status: "pending", message: "This order is already being checked.", data: { reference } })
+    }
+
+    const network = normalizePurchaseNetwork(liveOrder.network)
+    const catalogEntry = await getCatalogPackage(network, { packageId: liveOrder.packageId })
+    if (!catalogEntry) {
+      await updateOrderByReference(reference, { repairDispatchClaim: null, retryEligible: true, commercialReview: true })
+      return reply(202, { status: "pending", message: "This order needs a catalog review before delivery.", data: { reference } })
+    }
+    const { candidates } = await resolvePurchaseProviderCandidates(network, catalogEntry)
+    const dispatchCandidates = originalWasSubmitted && provider
+      ? candidates.filter((candidate) => candidate.provider !== provider)
+      : candidates
+    if (!dispatchCandidates.length) {
+      await updateOrderByReference(reference, { repairDispatchClaim: null, retryEligible: true, commercialReview: true })
+      return reply(202, { status: "pending", message: "No safe delivery route is available. This order is queued for review.", data: { reference } })
+    }
+
+    let result = null
+    let servingProvider = ""
+    let uncertain = false
+    for (const [index, candidate] of dispatchCandidates.entries()) {
+      servingProvider = candidate.provider
+      try {
+        result = await dispatchGuarded({ provider: servingProvider, network, catalogEntry, amount: liveOrder.amount, purchase: () => getProviderAdapter(servingProvider).purchase({
+          network, phone: liveOrder.phone, reference, catalogEntry, amount: liveOrder.amount,
+          providerIdempotencyKey: `${reference}:repair:${Number(liveOrder.repairAttempts || 0) + 1}`,
+          hasNextProvider: hasCandidateAfter(dispatchCandidates, index),
+        }) })
+        break
+      } catch (error) {
+        if (isIndeterminateProviderSubmissionError(error)) { uncertain = true; break }
+        logger.warn("Repair route refused", { reference, provider: servingProvider, errorCode: getErrorCode(error) })
+      }
+    }
+    if (uncertain) {
+      const pendingOrder = await updateOrderByReference(reference, {
+        provider: servingProvider, status: "processing", statusSource: "repair_submission_pending",
+        retryEligible: false, repairAttempts: Number(liveOrder.repairAttempts || 0) + 1,
+        repairDispatchClaim: null,
+        sync: { nextAttemptAt: Date.now() + CONFIG.orderSyncRetryDelayMs },
+      })
+      // Mark the intent submitted too, so no other entry point treats the
+      // order as never-dispatched while the provider's answer is unknown.
+      await syncPurchaseIntentFromOrder(reference, pendingOrder.order || liveOrder, {
+        providerSubmissionStatus: "submitted", retryEligible: false,
+      }).catch(() => null)
+      return reply(202, { status: "pending", message: "Delivery is awaiting confirmation. Please check this order before trying again.", data: { reference, orderStatus: "processing" } })
+    }
+    if (!result) {
+      await updateOrderByReference(reference, {
+        status: "failed", repairDispatchClaim: null, retryEligible: false,
+        commercialReview: true, statusSource: "repair_review",
+      }, { manual: true })
+      return reply(202, { status: "pending", message: "No delivery route accepted this order. It is queued for review.", data: { reference } })
+    }
+    const updated = await updateOrderByReference(reference, {
+      provider: servingProvider, status: result.status || "accepted", statusSource: "repair_dispatch",
+      statusUpdatedAt: Date.now(), repairedAt: Date.now(), retryEligible: false,
+      repairAttempts: Number(liveOrder.repairAttempts || 0) + 1,
+      providerReference: result.providerReference || "", providerOrderNumber: result.providerOrderNumber || "",
+      providerStatusRaw: result.providerStatusRaw || "accepted", repairDispatchClaim: null,
+    }, { manual: true })
+    await syncPurchaseIntentFromOrder(reference, updated.order, { paymentStatus: liveOrder.paymentStatus, retryEligible: false }).catch(() => null)
+    if (normalizeInternalOrderStatus(updated.order?.status, "") === "delivered") {
+      if (updated.order?.storefrontSlug) await settleStorefrontProfit(updated.order).catch((error) => logger.error("Store profit settlement failed", error, { reference }))
+      await queueRepairConfirmation({ reference, phone: updated.order?.phone, userId: located.userId, guest: updated.order?.isGuest === true }).catch(() => null)
+      runRepairNotificationQueue().catch((error) => logger.error("Repair notification send failed", error, { reference }))
+      return reply(200, { status: "success", message: "Delivery confirmed without another charge.", data: toPublicOrderRecord(updated.order) })
+    }
+    return reply(202, { status: "pending", message: "Delivery has been restarted without another charge. Check again for confirmation.", data: toPublicOrderRecord(updated.order) })
+  } catch (error) {
+    logger.error("Order repair failed", error, { reference })
+    return reply(503, { status: "pending", message: "We could not finish checking this order. Please check again shortly.", data: { reference } })
   } finally {
-    releaseTransactionLock(reference)
+    await releaseRepairLease(reference, leaseToken).catch((error) => logger.error("Repair lease release failed", error, { reference }))
   }
+}
+
+async function handleRepairOrder(req, res) {
+  const reference = String(req.params?.reference || req.body?.reference || "").trim()
+  const { code, body } = await runRepairPipeline({ reference, requesterUid: String(req.authUser?.uid || "") })
+  if (body?.data?.isGuest === true && body.data.phone) body.data = { ...body.data, phone: maskPhoneNumber(body.data.phone) }
+  return res.status(code).json(body)
+}
+
+app.post("/api/repair-order", optionalAuthenticateRequest, purchaseActionRateLimit, handleRepairOrder)
+app.post("/api/retry-transaction/:reference", authenticateRequest, purchaseActionRateLimit, handleRepairOrder)
+
+app.get("/api/receipt/:reference", optionalAuthenticateRequest, paymentVerificationRateLimit, async (req, res) => {
+  const reference = String(req.params.reference || "").trim()
+  if (!isValidRepairReference(reference)) return res.status(400).json({ status: "error", message: "Invalid reference" })
+  const located = await findOrderLocationByReference(reference, { includeOrder: true }).catch(() => null)
+  const order = located?.order
+  if (!order || (order.isGuest !== true && located.userId !== req.authUser?.uid)) {
+    return res.status(404).json({ status: "error", message: "Receipt not found" })
+  }
+  const data = toPublicOrderRecord(order)
+  // A guest receipt link can be forwarded; confirm the recipient without
+  // handing the full number to whoever holds the link.
+  if (order.isGuest === true) data.phone = maskPhoneNumber(data.phone)
+  res.set("Cache-Control", "no-store")
+  return res.json({ status: "success", data })
 })
 
 app.get("/api/transaction-status/:reference", authenticateRequest, purchaseActionRateLimit, async (req, res) => {

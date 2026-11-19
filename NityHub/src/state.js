@@ -11,10 +11,11 @@ class TransactionStore {
   }
 
   setupPeriodicCleanup() {
+    // unref: housekeeping must never be what keeps the process alive.
     setInterval(() => {
       this.cleanup()
       this.memoryCleanup()
-    }, CONFIG.cacheCleanupInterval)
+    }, CONFIG.cacheCleanupInterval).unref?.()
   }
 
   memoryCleanup() {
@@ -187,4 +188,4 @@ setInterval(() => {
       userTransactionLocks.delete(userId)
     }
   }
-}, 60000) // Run every minute
+}, 60000).unref?.() // Run every minute

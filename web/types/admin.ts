@@ -36,6 +36,7 @@ export interface AdminOrder {
   label?: string;
   amount?: number;
   status?: string;
+  commercialReview?: boolean;
   providerStatusRaw?: string;
   providerStatusDescription?: string;
   paymentStatus?: string;
@@ -124,15 +125,15 @@ export interface ProviderMappingField {
  * which inputs to render and what to call them.
  */
 export const PROVIDER_MAPPING_FIELDS: Record<string, ProviderMappingField[]> = {
-  hubnet: [{ key: "network", label: "Network", hint: "Hubnet network slug — mtn, at or telecel" }],
+  hubnet: [{ key: "network", label: "Network", hint: "Network slug — mtn, at or telecel" }],
   godsway: [
-    { key: "networkKey", label: "Network key", hint: "CK-Godsway network code — YELLO for MTN, TELECEL for Telecel" },
+    { key: "networkKey", label: "Network key", hint: "Provider network code, such as YELLO or TELECEL" },
     { key: "capacity", label: "Capacity (GB)", hint: "Bundle size in GB, e.g. 1 or 1.5" },
   ],
-  gigshub: [{ key: "packageId", label: "Package ID", hint: "The GiGSHUB plan id for this bundle" }],
+  gigshub: [{ key: "packageId", label: "Package ID", hint: "Provider plan id for this bundle" }],
   pbmhub: [
-    { key: "network", label: "Network id", hint: "PBM HUB network id — mtnup2u, airteltigo or telecel" },
-    { key: "size", label: "Size", hint: "Exactly as PBM HUB lists it, e.g. 1GB or 500MB" },
+    { key: "network", label: "Network id", hint: "Provider network id — mtnup2u, airteltigo or telecel" },
+    { key: "size", label: "Size", hint: "Exactly as the provider lists it, e.g. 1GB or 500MB" },
   ],
 };
 
